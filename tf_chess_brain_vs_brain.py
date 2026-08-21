@@ -81,6 +81,8 @@ _bootstrap()
 
 import argparse
 import time
+import logging
+import traceback
 import numpy as np
 import chess
 import tensorflow as tf
@@ -90,6 +92,28 @@ from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 
 tf.get_logger().setLevel("ERROR")
+
+# ---------------------------------------------------------------------------
+# Error / debug logging  (file + console)
+# ---------------------------------------------------------------------------
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(
+    _LOG_DIR,
+    f"chess_brain_{time.strftime('%Y%m%d_%H%M%S')}.log",
+)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("chess_brain")
+log.info("Logging to %s", _LOG_FILE)
 
 # ---------------------------------------------------------------------------
 # Board encoding: 8x8x12 planes (6 piece types x 2 colors) + side-to-move plane
@@ -518,6 +542,13 @@ class ChessGUI:
         ttk.Label(side, text=settings, font=("Helvetica", 8), foreground="#555").pack(
             anchor="w", pady=(10, 0)
         )
+        ttk.Label(
+            side,
+            text=f"Log: {_LOG_FILE}",
+            font=("Helvetica", 7),
+            foreground="#888",
+            wraplength=280,
+        ).pack(anchor="w", pady=(4, 0))
 
         self.draw_board()
 
@@ -635,11 +666,30 @@ class ChessGUI:
 
     def _run_loop(self):
         try:
+            log.info(
+                "Starting %d games  depth=%d  temp=%.2f  delay=%.2f",
+                self.args.games, self.args.search_depth,
+                self.args.temperature, self.args.delay,
+            )
             for g in range(1, self.args.games + 1):
                 if self.stop_requested:
+                    log.info("Stop requested — exiting after game %d", g - 1)
                     break
                 self.msg_queue.put(("status", f"Game {g}/{self.args.games} — starting..."))
-                memory, outcome, result = self._play_one_game(g)
+                log.info("=== Game %d / %d ===", g, self.args.games)
+                try:
+                    memory, outcome, result = self._play_one_game(g)
+                except Exception as game_err:
+                    log.exception("Game %d crashed", g)
+                    self.msg_queue.put((
+                        "history",
+                        f"Game {g}: ERROR — {game_err}"
+                    ))
+                    self.msg_queue.put((
+                        "status",
+                        f"Game {g} error (see log): {game_err}"
+                    ))
+                    continue
 
                 # Update scoreboard
                 if result == "1-0":
@@ -653,6 +703,7 @@ class ChessGUI:
                     tag = "unfinished (ply cap)" if result == "*" else "drawn"
                     line = f"Game {g}: draw ({tag})  ({result})"
                 self.history.append(line)
+                log.info(line)
                 self.msg_queue.put(("history", line))
                 self.msg_queue.put((
                     "score",
@@ -663,19 +714,32 @@ class ChessGUI:
 
                 # Train heads
                 self.msg_queue.put(("status", f"Game {g} finished — training heads..."))
-                found_before = [w.numpy().copy() for w in self.foundation.weights]
-                loss1 = train_head(self.brain_p1, memory[chess.WHITE],
-                                   outcome[chess.WHITE], "P1")
-                loss2 = train_head(self.brain_p2, memory[chess.BLACK],
-                                   outcome[chess.BLACK], "P2")
-                found_after = [w.numpy() for w in self.foundation.weights]
-                drift = max(np.max(np.abs(a - b)) for a, b in zip(found_before, found_after))
-                train_msg = (
-                    f"Trained P1 loss={loss1:.4f if loss1 else '—'}  "
-                    f"P2 loss={loss2:.4f if loss2 else '—'}  "
-                    f"(foundation drift {drift:.1e})"
-                )
-                self.msg_queue.put(("status", train_msg))
+                try:
+                    found_before = [w.numpy().copy() for w in self.foundation.weights]
+                    loss1 = train_head(self.brain_p1, memory[chess.WHITE],
+                                       outcome[chess.WHITE], "P1")
+                    loss2 = train_head(self.brain_p2, memory[chess.BLACK],
+                                       outcome[chess.BLACK], "P2")
+                    found_after = [w.numpy() for w in self.foundation.weights]
+                    drift = max(
+                        np.max(np.abs(a - b))
+                        for a, b in zip(found_before, found_after)
+                    )
+                    loss1_s = f"{loss1:.4f}" if loss1 is not None else "—"
+                    loss2_s = f"{loss2:.4f}" if loss2 is not None else "—"
+                    train_msg = (
+                        f"Trained P1 loss={loss1_s}  "
+                        f"P2 loss={loss2_s}  "
+                        f"(foundation drift {drift:.1e})"
+                    )
+                    log.info("Game %d training: %s", g, train_msg)
+                    self.msg_queue.put(("status", train_msg))
+                except Exception as train_err:
+                    log.exception("Training failed after game %d", g)
+                    self.msg_queue.put((
+                        "status",
+                        f"Training error (see log): {train_err}"
+                    ))
                 time.sleep(0.4)
 
             final = (
@@ -683,10 +747,12 @@ class ChessGUI:
                 f"P2 wins: {self.scoreboard['P2_wins']}  |  "
                 f"Draws: {self.scoreboard['draws']}"
             )
+            log.info(final)
             self.msg_queue.put(("done", final))
         except Exception as e:
-            import traceback
-            self.msg_queue.put(("error", f"{e}\n\n{traceback.format_exc()}"))
+            tb = traceback.format_exc()
+            log.error("Fatal error in game loop:\n%s", tb)
+            self.msg_queue.put(("error", f"{e}\n\n{tb}\n\nFull log: {_LOG_FILE}"))
 
     def _play_one_game(self, game_num: int):
         board = chess.Board()
@@ -709,14 +775,22 @@ class ChessGUI:
             self.msg_queue.put(("status", f"Game {game_num}  |  Ply {ply+1}  |  {who} thinking..."))
 
             t0 = time.time()
-            move, pre_enc, score = choose_move(
-                brain, board,
-                temperature=self.args.temperature,
-                search_depth=self.args.search_depth,
-            )
+            try:
+                move, pre_enc, score = choose_move(
+                    brain, board,
+                    temperature=self.args.temperature,
+                    search_depth=self.args.search_depth,
+                )
+            except Exception:
+                log.exception(
+                    "choose_move failed  game=%d ply=%d side=%s fen=%s",
+                    game_num, ply + 1, who, board.fen(),
+                )
+                raise
             move_ms = (time.time() - t0) * 1000
 
             if move is None:
+                log.warning("No legal move at game=%d ply=%d fen=%s", game_num, ply + 1, board.fen())
                 break
 
             board.push(move)
@@ -724,6 +798,10 @@ class ChessGUI:
             memory[mover].append((pre_enc, material_after))
             self.last_move = move
 
+            log.debug(
+                "Game %d ply %d  %s  %s  eval=%+.3f  %.0fms",
+                game_num, ply + 1, who, move.uci(), score, move_ms,
+            )
             self.msg_queue.put(("board", board.copy(), move))
             self.msg_queue.put(("eval", f"Eval: {score:+.3f}   ({move_ms:.0f} ms)"))
             self.msg_queue.put(("move", f"Last move: {move.uci()}  ({who})"))
