@@ -1,7 +1,7 @@
-
+#!/usr/bin/env python3
 """
-TensorFlow Chess: Brain vs Brain
-================================
+TensorFlow Chess: Brain vs Brain  —  Graphical Edition
+======================================================
 
 Two players, each with their OWN brain model:
   - Player 1 Brain (White)
@@ -11,20 +11,22 @@ Each brain has the SAME architecture:
   - Frozen foundation layers (read-only, shared initialization, then locked)
   - Trainable "learning head" layers on top (each player's own)
 
-They play chess against each other in the terminal (Unicode board).
+They play chess against each other on a realistic Tkinter board.
 After every game, each brain trains ONLY its learning head on the
 move outcomes it experienced (win = reinforce chosen moves,
 loss = discourage them). The frozen foundation never changes.
 
 Run:
-    python tf_chess_brain_vs_brain.py
-    python tf_chess_brain_vs_brain.py --games 20 --delay 0.15
+    python tf_chess_brain_vs_brain_gui.py
+    python tf_chess_brain_vs_brain_gui.py --games 20 --delay 0.3
 """
 
 import os
 import sys
 import subprocess
 import shutil
+import threading
+import queue
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -61,6 +63,10 @@ def _bootstrap():
     except ImportError:
         _pip_install("chess")
     try:
+        from PIL import Image, ImageTk  # noqa: F401
+    except ImportError:
+        _pip_install("Pillow")
+    try:
         import tensorflow  # noqa: F401
     except ImportError:
         if _detect_gpu():
@@ -79,6 +85,9 @@ import numpy as np
 import chess
 import tensorflow as tf
 from tensorflow.keras import layers, Model
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
 
 tf.get_logger().setLevel("ERROR")
 
@@ -142,18 +151,10 @@ def build_brain(name: str, foundation: Model, head_seed: int) -> Model:
 
 # ---------------------------------------------------------------------------
 # Move selection: alpha-beta minimax with the brain as the leaf evaluator.
-#
-# The brain scores a position from the side-to-move's POV in [-1, 1]. Search
-# lets it see tactics and avoid the shuffling / repetition draws you get from
-# pure one-ply greedy play. Captures and checks get one extra ply of "quiet"
-# search so we don't stop the search mid-exchange.
 # ---------------------------------------------------------------------------
-_EVAL_CACHE = {}   # (fen_key) -> score-from-side-to-move POV
-_MATE_SCORE = 1.0  # tanh-normalized brain scores live in [-1, 1]
+_EVAL_CACHE = {}
+_MATE_SCORE = 1.0
 
-# Cache one tf.function per brain — the raw Keras __call__ has ~0.5ms of
-# Python dispatch overhead which dominates when we call it thousands of times
-# inside a search. Compiling to a concrete function drops that to microseconds.
 _BRAIN_FN_CACHE = {}
 def _brain_fn(brain: Model):
     fn = _BRAIN_FN_CACHE.get(id(brain))
@@ -165,8 +166,6 @@ def _brain_fn(brain: Model):
         fn = _fn
     return fn
 
-# Simple material fallback so the leaf eval isn't purely the brain — helps a
-# lot with tactics even when the brain's take is mushy.
 _PIECE_VAL = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
               chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
 
@@ -181,7 +180,7 @@ def _material_from_pov(board: chess.Board) -> float:
 def _terminal_score(board: chess.Board):
     """None if not terminal, else score-from-side-to-move POV."""
     if board.is_checkmate():
-        return -_MATE_SCORE            # side-to-move is mated -> very bad
+        return -_MATE_SCORE
     if (board.is_stalemate() or board.is_insufficient_material()
             or board.is_seventyfive_moves() or board.is_fivefold_repetition()
             or board.can_claim_threefold_repetition()
@@ -198,28 +197,25 @@ def _leaf_eval(brain: Model, board: chess.Board) -> float:
     enc = encode_board(board)[None, ...]
     brain_val = float(_brain_fn(brain)(tf.constant(enc)).numpy().flatten()[0])
     mat = _material_from_pov(board)
-    # 70% brain, 30% material — brain still leads, material stops it from
-    # hallucinating that being down a rook is "fine".
     score = 0.7 * brain_val + 0.3 * np.tanh(mat * 1.5)
     _EVAL_CACHE[key] = score
     return score
 
 def _order_moves(board: chess.Board):
-    """Cheap move ordering: captures & promotions first, then checks, then rest.
-    Better ordering -> more alpha-beta cutoffs -> much faster search."""
+    """Cheap move ordering: captures & promotions first, then checks, then rest."""
     def key(mv):
         score = 0
         if board.is_capture(mv):
             victim = board.piece_at(mv.to_square)
             attacker = board.piece_at(mv.from_square)
-            v_val = _PIECE_VAL.get(victim.piece_type, 0) if victim else 1  # ep
+            v_val = _PIECE_VAL.get(victim.piece_type, 0) if victim else 1
             a_val = _PIECE_VAL.get(attacker.piece_type, 0) if attacker else 0
-            score += 100 + 10 * v_val - a_val   # MVV-LVA
+            score += 100 + 10 * v_val - a_val
         if mv.promotion:
             score += 90
         if board.gives_check(mv):
             score += 5
-        return -score   # sort ascending -> best first
+        return -score
     return sorted(board.legal_moves, key=key)
 
 def _alphabeta(brain: Model, board: chess.Board, depth: int,
@@ -230,8 +226,6 @@ def _alphabeta(brain: Model, board: chess.Board, depth: int,
         return term
 
     if depth <= 0:
-        # Quiescence: keep searching noisy moves (captures / promotions) so
-        # we don't cut off in the middle of an exchange.
         stand_pat = _leaf_eval(brain, board)
         if q_depth <= 0:
             return stand_pat
@@ -265,26 +259,25 @@ def _alphabeta(brain: Model, board: chess.Board, depth: int,
 def choose_move(brain: Model, board: chess.Board, temperature: float = 0.4,
                 search_depth: int = 2):
     """Search each root move `search_depth` plies deep with the brain as the
-    leaf evaluator. Softmax-sample among the top scorers using `temperature`
-    so games aren't deterministic; temperature=0 = strictly greedy."""
+    leaf evaluator. Softmax-sample among the top scorers using `temperature`."""
     legal = list(board.legal_moves)
     if not legal:
         return None, None, None
 
-    # Fresh cache per move — positions rarely repeat across different roots
-    # and the cache would just grow unbounded.
     _EVAL_CACHE.clear()
 
     pre_move_encoding = encode_board(board)
     root_scores = np.empty(len(legal), dtype=np.float32)
 
     if search_depth <= 0:
-        # Cheap one-ply path (legacy behavior).
         batch = np.zeros((len(legal), 8, 8, 13), dtype=np.float32)
-        for i, mv in enumerate(_order_moves(board)):
-            board.push(mv); batch[i] = encode_board(board); board.pop()
+        ordered = _order_moves(board)
+        for i, mv in enumerate(ordered):
+            board.push(mv)
+            batch[i] = encode_board(board)
+            board.pop()
         opp = brain.predict(batch, verbose=0).flatten()
-        legal = _order_moves(board)
+        legal = ordered
         root_scores = -opp
     else:
         alpha, beta = -2.0, 2.0
@@ -292,13 +285,12 @@ def choose_move(brain: Model, board: chess.Board, temperature: float = 0.4,
         legal = ordered
         for i, mv in enumerate(ordered):
             board.push(mv)
-            # After we move, it's opponent's turn — negate their score.
             val = -_alphabeta(brain, board, search_depth - 1,
                               -beta, -alpha, q_depth=2)
             board.pop()
             root_scores[i] = val
             if val > alpha:
-                alpha = val   # narrows the window for later root moves
+                alpha = val
 
     if temperature > 1e-6:
         logits = root_scores / temperature
@@ -314,49 +306,7 @@ def choose_move(brain: Model, board: chess.Board, temperature: float = 0.4,
 
 
 # ---------------------------------------------------------------------------
-# Terminal rendering
-# ---------------------------------------------------------------------------
-UNICODE = {
-    "P": "♙", "N": "♘", "B": "♗", "R": "♖", "Q": "♕", "K": "♔",
-    "p": "♟", "n": "♞", "b": "♝", "r": "♜", "q": "♛", "k": "♚",
-}
-RESET = "\033[0m"
-LIGHT_BG = "\033[47m"
-DARK_BG  = "\033[100m"
-FG_BLACK = "\033[30m"
-FG_WHITE = "\033[97m"
-BOLD = "\033[1m"
-
-def render_board(board: chess.Board, header: str = ""):
-    lines = []
-    if header:
-        lines.append(BOLD + header + RESET)
-    lines.append("   a  b  c  d  e  f  g  h ")
-    for rank in range(7, -1, -1):
-        row = [f" {rank+1} "]
-        for file in range(8):
-            sq = chess.square(file, rank)
-            piece = board.piece_at(sq)
-            bg = LIGHT_BG if (rank + file) % 2 == 0 else DARK_BG
-            if piece:
-                sym = UNICODE[piece.symbol()]
-                fg = FG_WHITE if piece.color == chess.WHITE else FG_BLACK
-                row.append(f"{bg}{fg} {sym} {RESET}")
-            else:
-                row.append(f"{bg}   {RESET}")
-        row.append(f" {rank+1}")
-        lines.append("".join(row))
-    lines.append("   a  b  c  d  e  f  g  h ")
-    print("\n".join(lines))
-
-
-def clear_screen():
-    sys.stdout.write("\033[H\033[J")
-    sys.stdout.flush()
-
-
-# ---------------------------------------------------------------------------
-# Reward shaping: material + game outcome
+# Reward shaping
 # ---------------------------------------------------------------------------
 PIECE_VALUE = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
@@ -368,208 +318,464 @@ def material_balance(board: chess.Board, color: bool) -> float:
     for piece_type, val in PIECE_VALUE.items():
         v += val * len(board.pieces(piece_type, color))
         v -= val * len(board.pieces(piece_type, not color))
-    return v / 39.0   # normalize to roughly [-1, 1]
+    return v / 39.0
 
 
 # ---------------------------------------------------------------------------
-# Play one game
-# ---------------------------------------------------------------------------
-def format_history(history, scoreboard) -> str:
-    """Multi-line history block printed above the board on every frame."""
-    lines = []
-    lines.append(BOLD + "=" * 60 + RESET)
-    lines.append(BOLD + "Game history" + RESET)
-    if not history:
-        lines.append("  (no games completed yet)")
-    else:
-        for entry in history:
-            lines.append("  " + entry)
-    lines.append(BOLD +
-        f"Total  |  Player 1: {scoreboard['P1_wins']} wins  |  "
-        f"Player 2: {scoreboard['P2_wins']} wins  |  "
-        f"Draws: {scoreboard['draws']}" + RESET)
-    lines.append(BOLD + "=" * 60 + RESET)
-    return "\n".join(lines)
-
-
-def play_game(brain_white: Model, brain_black: Model, game_num: int,
-              delay: float, max_plies: int = 400, temperature: float = 0.4,
-              search_depth: int = 2, history=None, scoreboard=None):
-    board = chess.Board()
-    history = history if history is not None else []
-    scoreboard = scoreboard if scoreboard is not None else \
-        {"P1_wins": 0, "P2_wins": 0, "draws": 0}
-
-    # Per-player memory: list of (encoded_position, immediate_material_after)
-    memory = {chess.WHITE: [], chess.BLACK: []}
-
-    ply = 0
-    while not board.is_game_over(claim_draw=True) and ply < max_plies:
-        mover = board.turn
-        brain = brain_white if mover == chess.WHITE else brain_black
-        t0 = time.time()
-        move, pre_enc, score = choose_move(brain, board, temperature=temperature,
-                                           search_depth=search_depth)
-        move_ms = (time.time() - t0) * 1000
-        if move is None:
-            break
-
-        board.push(move)
-        material_after = material_balance(board, mover)
-        memory[mover].append((pre_enc, material_after))
-
-        clear_screen()
-        # Persistent history block at the top of every frame.
-        print(format_history(history, scoreboard))
-        who = "Player 1 Brain (White)" if mover == chess.WHITE else "Player 2 Brain (Black)"
-        header = (f"Game {game_num}  |  Ply {ply+1}  |  {who} plays {move.uci()}"
-                  f"  |  eval {score:+.3f}  |  {move_ms:.0f} ms  |  d={search_depth}")
-        render_board(board, header=header)
-        # Show draw-pressure info so it's obvious WHY a game ended.
-        print(f"\nFEN: {board.fen()}")
-        print(f"halfmove clock (50-move rule): {board.halfmove_clock}"
-              f"   |  can_claim_threefold: {board.can_claim_threefold_repetition()}"
-              f"   |  in check: {board.is_check()}")
-        ply += 1
-        if delay > 0:
-            time.sleep(delay)
-
-    # Outcome from each player's POV: +1 win, -1 loss, 0 draw
-    result = board.result(claim_draw=True)
-    if result == "1-0":
-        outcome = {chess.WHITE: 1.0, chess.BLACK: -1.0}
-        winner = "Player 1 (White)"
-    elif result == "0-1":
-        outcome = {chess.WHITE: -1.0, chess.BLACK: 1.0}
-        winner = "Player 2 (Black)"
-    else:
-        outcome = {chess.WHITE: 0.0, chess.BLACK: 0.0}
-        winner = "Draw"
-
-    print(f"\nResult: {result}  ({winner})  after {ply} plies")
-    return memory, outcome, result
-
-
-# ---------------------------------------------------------------------------
-# Train each player's learning head on the game it just played
+# Training
 # ---------------------------------------------------------------------------
 def train_head(brain: Model, memory_list, outcome: float, name: str):
     if not memory_list:
         return None
     X = np.stack([m[0] for m in memory_list])
     materials = np.array([m[1] for m in memory_list], dtype=np.float32)
-    # Blend immediate material signal with final outcome (outcome dominates).
     targets = np.clip(0.25 * materials + 0.75 * outcome, -1.0, 1.0)
     hist = brain.fit(X, targets, epochs=1, batch_size=32, verbose=0)
     loss = float(hist.history["loss"][0])
-    print(f"  trained {name} head on {len(X)} positions  |  loss = {loss:.4f}")
     return loss
+
+
+# ---------------------------------------------------------------------------
+# Graphical Chess Board (Tkinter)
+# ---------------------------------------------------------------------------
+SQUARE_SIZE = 64
+BOARD_SIZE = SQUARE_SIZE * 8
+LIGHT_COLOR = "#f0d9b5"
+DARK_COLOR = "#b58863"
+HIGHLIGHT_COLOR = "#cdd26a"
+LAST_MOVE_COLOR = "#aaa23a"
+CHECK_COLOR = "#e74c3c"
+
+PIECE_IMAGE_NAMES = {
+    'r': 'black_rook', 'n': 'black_knight', 'b': 'black_bishop',
+    'q': 'black_queen', 'k': 'black_king', 'p': 'black_pawn',
+    'R': 'white_rook', 'N': 'white_knight', 'B': 'white_bishop',
+    'Q': 'white_queen', 'K': 'white_king', 'P': 'white_pawn',
+}
+
+
+class ChessGUI:
+    def __init__(self, root, args):
+        self.root = root
+        self.args = args
+        self.root.title("TensorFlow Chess: Brain vs Brain")
+        self.root.resizable(False, False)
+
+        # Locate piece images (same folder as script, or cwd, or artifacts)
+        self.piece_dir = self._find_piece_dir()
+        self.piece_images = {}
+        self._load_images()
+
+        # State
+        self.board = chess.Board()
+        self.last_move = None
+        self.running = False
+        self.stop_requested = False
+        self.msg_queue = queue.Queue()
+
+        # Build models
+        self._build_models()
+
+        # Scoreboard / history
+        self.scoreboard = {"P1_wins": 0, "P2_wins": 0, "draws": 0}
+        self.history = []
+
+        # Layout
+        self._build_ui()
+
+        # Process UI messages from worker thread
+        self.root.after(100, self._process_queue)
+
+    def _find_piece_dir(self):
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "chess_pieces"),
+            os.path.join(os.getcwd(), "chess_pieces"),
+            "/home/workdir/artifacts/chess_pieces",
+            "chess_pieces",
+        ]
+        for d in candidates:
+            if os.path.isdir(d) and os.path.isfile(os.path.join(d, "white_king.png")):
+                return d
+        return candidates[0]
+
+    def _load_images(self):
+        target = int(SQUARE_SIZE * 0.85)
+        for symbol, name in PIECE_IMAGE_NAMES.items():
+            path = os.path.join(self.piece_dir, f"{name}.png")
+            if not os.path.isfile(path):
+                # Fallback: blank transparent
+                img = Image.new("RGBA", (target, target), (0, 0, 0, 0))
+            else:
+                img = Image.open(path).convert("RGBA")
+                img = img.resize((target, target), Image.LANCZOS)
+            self.piece_images[symbol] = ImageTk.PhotoImage(img)
+
+    def _build_models(self):
+        if self.args.load and os.path.isdir(self.args.load):
+            print(f"Loading pretrained brains from {self.args.load}...")
+            foundation = tf.keras.models.load_model(
+                os.path.join(self.args.load, "foundation.keras"), compile=False)
+            for layer in foundation.layers:
+                layer.trainable = False
+            brain_p1 = tf.keras.models.load_model(
+                os.path.join(self.args.load, "brain_player1.keras"), compile=False)
+            brain_p2 = tf.keras.models.load_model(
+                os.path.join(self.args.load, "brain_player2.keras"), compile=False)
+            brain_p1.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse")
+            brain_p2.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse")
+        else:
+            print("Building shared frozen foundation...")
+            foundation = build_foundation(seed=42)
+            print("Building Player 1 Brain (White)...")
+            brain_p1 = build_brain("player1", foundation, head_seed=101)
+            print("Building Player 2 Brain (Black)...")
+            brain_p2 = build_brain("player2", foundation, head_seed=202)
+
+        self.foundation = foundation
+        self.brain_p1 = brain_p1
+        self.brain_p2 = brain_p2
+
+        frozen = sum(np.prod(w.shape) for w in foundation.weights)
+        t1 = sum(np.prod(w.shape) for w in brain_p1.trainable_weights)
+        t2 = sum(np.prod(w.shape) for w in brain_p2.trainable_weights)
+        print(f"  foundation params (FROZEN): {frozen:,}")
+        print(f"  P1 trainable head params: {t1:,}")
+        print(f"  P2 trainable head params: {t2:,}")
+
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding=8)
+        main.grid(row=0, column=0, sticky="nsew")
+
+        # Left: board
+        board_frame = ttk.Frame(main)
+        board_frame.grid(row=0, column=0, rowspan=2, padx=(0, 12))
+
+        self.canvas = tk.Canvas(
+            board_frame,
+            width=BOARD_SIZE,
+            height=BOARD_SIZE,
+            highlightthickness=1,
+            highlightbackground="#333",
+        )
+        self.canvas.pack()
+
+        # Coordinates labels (optional aesthetic)
+        coord_frame = ttk.Frame(board_frame)
+        coord_frame.pack(fill="x")
+        for i, letter in enumerate("abcdefgh"):
+            ttk.Label(coord_frame, text=letter, width=4, anchor="center").grid(row=0, column=i)
+
+        # Right panel
+        side = ttk.Frame(main)
+        side.grid(row=0, column=1, sticky="nw")
+
+        ttk.Label(side, text="Brain vs Brain", font=("Helvetica", 14, "bold")).pack(anchor="w")
+        ttk.Label(side, text="Player 1 = White   |   Player 2 = Black",
+                  font=("Helvetica", 9)).pack(anchor="w", pady=(0, 8))
+
+        # Status
+        self.status_var = tk.StringVar(value="Ready. Press Start.")
+        status_lbl = ttk.Label(side, textvariable=self.status_var, wraplength=280,
+                               font=("Helvetica", 10))
+        status_lbl.pack(anchor="w", pady=(0, 6))
+
+        self.eval_var = tk.StringVar(value="Eval: —")
+        ttk.Label(side, textvariable=self.eval_var, font=("Courier", 10)).pack(anchor="w")
+
+        self.move_var = tk.StringVar(value="Last move: —")
+        ttk.Label(side, textvariable=self.move_var, font=("Courier", 10)).pack(anchor="w", pady=(0, 8))
+
+        # Scoreboard
+        score_frame = ttk.LabelFrame(side, text="Scoreboard", padding=6)
+        score_frame.pack(fill="x", pady=(0, 8))
+        self.score_var = tk.StringVar(value="P1: 0   P2: 0   Draws: 0")
+        ttk.Label(score_frame, textvariable=self.score_var,
+                  font=("Helvetica", 11, "bold")).pack()
+
+        # History
+        hist_frame = ttk.LabelFrame(side, text="Game History", padding=4)
+        hist_frame.pack(fill="both", expand=True, pady=(0, 8))
+        self.hist_text = tk.Text(hist_frame, width=36, height=12, font=("Courier", 9),
+                                 state="disabled", wrap="word")
+        scroll = ttk.Scrollbar(hist_frame, command=self.hist_text.yview)
+        self.hist_text.configure(yscrollcommand=scroll.set)
+        self.hist_text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        # Controls
+        ctrl = ttk.Frame(side)
+        ctrl.pack(fill="x", pady=(4, 0))
+        self.start_btn = ttk.Button(ctrl, text="Start", command=self.start_games)
+        self.start_btn.pack(side="left", padx=(0, 6))
+        self.stop_btn = ttk.Button(ctrl, text="Stop", command=self.request_stop, state="disabled")
+        self.stop_btn.pack(side="left")
+
+        # Settings summary
+        settings = (
+            f"Games: {self.args.games}  |  Depth: {self.args.search_depth}\n"
+            f"Temp: {self.args.temperature}  |  Delay: {self.args.delay}s"
+        )
+        ttk.Label(side, text=settings, font=("Helvetica", 8), foreground="#555").pack(
+            anchor="w", pady=(10, 0)
+        )
+
+        self.draw_board()
+
+    def draw_board(self):
+        self.canvas.delete("all")
+        # Squares
+        for row in range(8):
+            for col in range(8):
+                x0 = col * SQUARE_SIZE
+                y0 = row * SQUARE_SIZE
+                x1 = x0 + SQUARE_SIZE
+                y1 = y0 + SQUARE_SIZE
+                color = LIGHT_COLOR if (row + col) % 2 == 0 else DARK_COLOR
+                self.canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="")
+
+        # Highlight last move
+        if self.last_move is not None:
+            for sq in (self.last_move.from_square, self.last_move.to_square):
+                col = chess.square_file(sq)
+                row = 7 - chess.square_rank(sq)
+                x0 = col * SQUARE_SIZE
+                y0 = row * SQUARE_SIZE
+                self.canvas.create_rectangle(
+                    x0, y0, x0 + SQUARE_SIZE, y0 + SQUARE_SIZE,
+                    fill=LAST_MOVE_COLOR, outline="", stipple="gray50"
+                )
+
+        # Check highlight
+        if self.board.is_check():
+            king_sq = self.board.king(self.board.turn)
+            if king_sq is not None:
+                col = chess.square_file(king_sq)
+                row = 7 - chess.square_rank(king_sq)
+                x0 = col * SQUARE_SIZE
+                y0 = row * SQUARE_SIZE
+                self.canvas.create_rectangle(
+                    x0, y0, x0 + SQUARE_SIZE, y0 + SQUARE_SIZE,
+                    fill=CHECK_COLOR, outline="", stipple="gray25"
+                )
+
+        # Pieces
+        for sq, piece in self.board.piece_map().items():
+            col = chess.square_file(sq)
+            row = 7 - chess.square_rank(sq)
+            img = self.piece_images.get(piece.symbol())
+            if img:
+                cx = col * SQUARE_SIZE + SQUARE_SIZE // 2
+                cy = row * SQUARE_SIZE + SQUARE_SIZE // 2
+                self.canvas.create_image(cx, cy, image=img)
+
+        # Rank numbers on left edge
+        for row in range(8):
+            rank = 8 - row
+            self.canvas.create_text(
+                6, row * SQUARE_SIZE + 10,
+                text=str(rank), anchor="nw",
+                fill="#333" if (row % 2 == 0) else "#eee",
+                font=("Helvetica", 9, "bold")
+            )
+
+    def _process_queue(self):
+        try:
+            while True:
+                msg = self.msg_queue.get_nowait()
+                kind = msg[0]
+                if kind == "board":
+                    self.board = msg[1]
+                    self.last_move = msg[2]
+                    self.draw_board()
+                elif kind == "status":
+                    self.status_var.set(msg[1])
+                elif kind == "eval":
+                    self.eval_var.set(msg[1])
+                elif kind == "move":
+                    self.move_var.set(msg[1])
+                elif kind == "score":
+                    self.score_var.set(msg[1])
+                elif kind == "history":
+                    self.hist_text.configure(state="normal")
+                    self.hist_text.insert("end", msg[1] + "\n")
+                    self.hist_text.see("end")
+                    self.hist_text.configure(state="disabled")
+                elif kind == "done":
+                    self.running = False
+                    self.start_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+                    self.status_var.set(msg[1])
+                elif kind == "error":
+                    messagebox.showerror("Error", msg[1])
+                    self.running = False
+                    self.start_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.root.after(80, self._process_queue)
+
+    def start_games(self):
+        if self.running:
+            return
+        self.running = True
+        self.stop_requested = False
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.hist_text.configure(state="normal")
+        self.hist_text.delete("1.0", "end")
+        self.hist_text.configure(state="disabled")
+        self.scoreboard = {"P1_wins": 0, "P2_wins": 0, "draws": 0}
+        self.history = []
+        t = threading.Thread(target=self._run_loop, daemon=True)
+        t.start()
+
+    def request_stop(self):
+        self.stop_requested = True
+        self.status_var.set("Stopping after current game...")
+
+    def _run_loop(self):
+        try:
+            for g in range(1, self.args.games + 1):
+                if self.stop_requested:
+                    break
+                self.msg_queue.put(("status", f"Game {g}/{self.args.games} — starting..."))
+                memory, outcome, result = self._play_one_game(g)
+
+                # Update scoreboard
+                if result == "1-0":
+                    self.scoreboard["P1_wins"] += 1
+                    line = f"Game {g}: Player 1 WIN, Player 2 loss  ({result})"
+                elif result == "0-1":
+                    self.scoreboard["P2_wins"] += 1
+                    line = f"Game {g}: Player 1 loss, Player 2 WIN  ({result})"
+                else:
+                    self.scoreboard["draws"] += 1
+                    tag = "unfinished (ply cap)" if result == "*" else "drawn"
+                    line = f"Game {g}: draw ({tag})  ({result})"
+                self.history.append(line)
+                self.msg_queue.put(("history", line))
+                self.msg_queue.put((
+                    "score",
+                    f"P1: {self.scoreboard['P1_wins']}   "
+                    f"P2: {self.scoreboard['P2_wins']}   "
+                    f"Draws: {self.scoreboard['draws']}"
+                ))
+
+                # Train heads
+                self.msg_queue.put(("status", f"Game {g} finished — training heads..."))
+                found_before = [w.numpy().copy() for w in self.foundation.weights]
+                loss1 = train_head(self.brain_p1, memory[chess.WHITE],
+                                   outcome[chess.WHITE], "P1")
+                loss2 = train_head(self.brain_p2, memory[chess.BLACK],
+                                   outcome[chess.BLACK], "P2")
+                found_after = [w.numpy() for w in self.foundation.weights]
+                drift = max(np.max(np.abs(a - b)) for a, b in zip(found_before, found_after))
+                train_msg = (
+                    f"Trained P1 loss={loss1:.4f if loss1 else '—'}  "
+                    f"P2 loss={loss2:.4f if loss2 else '—'}  "
+                    f"(foundation drift {drift:.1e})"
+                )
+                self.msg_queue.put(("status", train_msg))
+                time.sleep(0.4)
+
+            final = (
+                f"Finished.  P1 wins: {self.scoreboard['P1_wins']}  |  "
+                f"P2 wins: {self.scoreboard['P2_wins']}  |  "
+                f"Draws: {self.scoreboard['draws']}"
+            )
+            self.msg_queue.put(("done", final))
+        except Exception as e:
+            import traceback
+            self.msg_queue.put(("error", f"{e}\n\n{traceback.format_exc()}"))
+
+    def _play_one_game(self, game_num: int):
+        board = chess.Board()
+        memory = {chess.WHITE: [], chess.BLACK: []}
+        self.last_move = None
+        self.msg_queue.put(("board", board.copy(), None))
+
+        ply = 0
+        max_plies = self.args.max_plies
+        delay = self.args.delay
+
+        while not board.is_game_over(claim_draw=True) and ply < max_plies:
+            if self.stop_requested:
+                break
+
+            mover = board.turn
+            brain = self.brain_p1 if mover == chess.WHITE else self.brain_p2
+            who = "Player 1 (White)" if mover == chess.WHITE else "Player 2 (Black)"
+
+            self.msg_queue.put(("status", f"Game {game_num}  |  Ply {ply+1}  |  {who} thinking..."))
+
+            t0 = time.time()
+            move, pre_enc, score = choose_move(
+                brain, board,
+                temperature=self.args.temperature,
+                search_depth=self.args.search_depth,
+            )
+            move_ms = (time.time() - t0) * 1000
+
+            if move is None:
+                break
+
+            board.push(move)
+            material_after = material_balance(board, mover)
+            memory[mover].append((pre_enc, material_after))
+            self.last_move = move
+
+            self.msg_queue.put(("board", board.copy(), move))
+            self.msg_queue.put(("eval", f"Eval: {score:+.3f}   ({move_ms:.0f} ms)"))
+            self.msg_queue.put(("move", f"Last move: {move.uci()}  ({who})"))
+            self.msg_queue.put((
+                "status",
+                f"Game {game_num}  |  Ply {ply+1}  |  {who} played {move.uci()}"
+            ))
+
+            ply += 1
+            if delay > 0:
+                time.sleep(delay)
+
+        # Outcome
+        result = board.result(claim_draw=True)
+        if result == "1-0":
+            outcome = {chess.WHITE: 1.0, chess.BLACK: -1.0}
+        elif result == "0-1":
+            outcome = {chess.WHITE: -1.0, chess.BLACK: 1.0}
+        else:
+            outcome = {chess.WHITE: 0.0, chess.BLACK: 0.0}
+
+        return memory, outcome, result
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="TensorFlow Chess Brain vs Brain (GUI)")
     parser.add_argument("--games", type=int, default=5, help="number of games")
-    parser.add_argument("--delay", type=float, default=0.20,
+    parser.add_argument("--delay", type=float, default=0.25,
                         help="seconds between moves (0 = no delay)")
     parser.add_argument("--max-plies", type=int, default=400)
     parser.add_argument("--temperature", type=float, default=0.4,
                         help="exploration temperature; 0 = greedy")
     parser.add_argument("--search-depth", type=int, default=2,
-                        help="alpha-beta search depth in plies (0 = no search, "
-                             "pure one-ply greedy). 2-3 is a good tradeoff; "
-                             "4+ gets slow without a GPU.")
+                        help="alpha-beta search depth in plies")
     parser.add_argument("--load", type=str, default=None,
-                        help="Directory with pretrained brain_player1.keras / "
-                             "brain_player2.keras / foundation.keras "
-                             "(from pretrain_parallel.py)")
+                        help="Directory with pretrained .keras models")
     args = parser.parse_args()
 
-    if args.load and os.path.isdir(args.load):
-        print(f"Loading pretrained brains from {args.load}...")
-        foundation = tf.keras.models.load_model(
-            os.path.join(args.load, "foundation.keras"), compile=False)
-        for layer in foundation.layers:
-            layer.trainable = False
-        brain_p1 = tf.keras.models.load_model(
-            os.path.join(args.load, "brain_player1.keras"), compile=False)
-        brain_p2 = tf.keras.models.load_model(
-            os.path.join(args.load, "brain_player2.keras"), compile=False)
-        brain_p1.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse")
-        brain_p2.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss="mse")
-        frozen_params = sum(np.prod(w.shape) for w in foundation.weights)
-        print(f"  foundation params (FROZEN): {frozen_params:,}")
-    else:
-        print("Building shared frozen foundation...")
-        foundation = build_foundation(seed=42)
-        frozen_params = sum(np.prod(w.shape) for w in foundation.weights)
-        print(f"  foundation params (FROZEN, read-only): {frozen_params:,}")
+    root = tk.Tk()
+    # Try a slightly nicer theme if available
+    try:
+        style = ttk.Style()
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+    except Exception:
+        pass
 
-        print("Building Player 1 Brain (White) with its own learning head...")
-        brain_p1 = build_brain("player1", foundation, head_seed=101)
-        print("Building Player 2 Brain (Black) with its own learning head...")
-        brain_p2 = build_brain("player2", foundation, head_seed=202)
-
-    def trainable_count(m):
-        return sum(np.prod(w.shape) for w in m.trainable_weights)
-    print(f"  P1 trainable head params: {trainable_count(brain_p1):,}")
-    print(f"  P2 trainable head params: {trainable_count(brain_p2):,}")
-    print()
-
-    scoreboard = {"P1_wins": 0, "P2_wins": 0, "draws": 0}
-    history = []  # list of pre-formatted per-game summary lines
-
-    for g in range(1, args.games + 1):
-        memory, outcome, result = play_game(
-            brain_p1, brain_p2, game_num=g,
-            delay=args.delay, max_plies=args.max_plies,
-            temperature=args.temperature,
-            search_depth=args.search_depth,
-            history=history, scoreboard=scoreboard,
-        )
-
-        # Update running scoreboard + append a history line in the requested
-        # "Game N: player 1 win, player 2 loss" form.
-        if result == "1-0":
-            scoreboard["P1_wins"] += 1
-            line = (f"Game {g}: player 1 WIN, player 2 loss   "
-                    f"(result {result})")
-        elif result == "0-1":
-            scoreboard["P2_wins"] += 1
-            line = (f"Game {g}: player 1 loss, player 2 WIN   "
-                    f"(result {result})")
-        else:
-            scoreboard["draws"] += 1
-            # `*` means the ply cap hit; a real drawn result claims 1/2-1/2.
-            tag = "unfinished (ply cap)" if result == "*" else "drawn"
-            line = (f"Game {g}: draw ({tag})           "
-                    f"(result {result})")
-        history.append(line)
-
-        # Sanity check: foundation weights unchanged before training
-        found_before = [w.numpy().copy() for w in foundation.weights]
-
-        print("\nTraining learning heads (foundation stays frozen)...")
-        train_head(brain_p1, memory[chess.WHITE], outcome[chess.WHITE], "P1")
-        train_head(brain_p2, memory[chess.BLACK], outcome[chess.BLACK], "P2")
-
-        # Verify frozen foundation didn't move
-        found_after = [w.numpy() for w in foundation.weights]
-        drift = max(np.max(np.abs(a - b)) for a, b in zip(found_before, found_after))
-        print(f"  foundation weight drift: {drift:.2e}  (should be 0)")
-
-        # Persistent running summary printed after each game too, so it stays
-        # visible in the scrollback even when the next game starts clearing.
-        print()
-        print(format_history(history, scoreboard))
-        print("-" * 60)
-
-    print("\nFinal scoreboard:")
-    print(f"  Player 1 Brain wins: {scoreboard['P1_wins']}")
-    print(f"  Player 2 Brain wins: {scoreboard['P2_wins']}")
-    print(f"  Draws:               {scoreboard['draws']}")
+    app = ChessGUI(root, args)
+    root.mainloop()
 
 
 if __name__ == "__main__":
