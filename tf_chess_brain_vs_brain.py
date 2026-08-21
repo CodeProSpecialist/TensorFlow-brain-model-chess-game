@@ -339,42 +339,29 @@ BORDER      = ( 25,  20,  18)   # frame around board
 LABEL_BG    = ( 15,  10,   8)
 LABEL_FG    = (230, 220, 200)
 
-# Piece / board material palette.
-# Mode: CHESS_MATERIAL=wood|marble (default wood).
-#   wood   → light-oak / dark-walnut pieces + matching wood board
-#   marble → Carrara / Nero Marquina pieces + matching marble board
+# Piece palette — polished marble.
+#   White pieces: Carrara marble with faint gray veining
+#   Black pieces: Nero Marquina marble with bright calcite veining
+#   Both get a strong specular highlight (H) for the polished-stone gleam.
 WP_O = ( 55,  50,  45); WP_S = (165, 155, 140); WP_M = (215, 208, 195)
 WP_B = (240, 233, 220); WP_H = (255, 252, 245); WP_J = (185,  40,  50)  # deep ruby
 BP_O = (  0,   0,   0); BP_S = ( 12,  10,  10); BP_M = ( 42,  38,  38)
 BP_B = ( 78,  72,  72); BP_H = (140, 130, 130); BP_J = ( 60, 130, 200)  # deep sapphire
+# Vein color used for a subtle overlay on the piece body.
 WP_VEIN = ( 90,  85,  80)
 BP_VEIN = (210, 205, 195)
 
-# Wood colours (pieces + board when material == "wood")
-LIGHT_WOOD_BASE  = (210, 170, 110)   # honey oak
-LIGHT_WOOD_DARK  = (160, 115,  65)   # deeper oak rings
-LIGHT_WOOD_GRAIN = (120,  80,  40)   # fine dark grain lines
-DARK_WOOD_BASE   = ( 55,  32,  18)   # walnut body
-DARK_WOOD_DARK   = ( 28,  16,   8)   # near-ebony rings
-DARK_WOOD_GRAIN  = ( 90,  55,  30)   # lighter grain highlights
-
-# Material mode + render size (fit ~800x800 GNOME terminal by default)
-_MATERIAL = os.environ.get("CHESS_MATERIAL", "wood").strip().lower()
-if _MATERIAL not in ("wood", "marble"):
-    _MATERIAL = "wood"
-# SQ = pixels per square edge in the rendered image.
-# Terminal footprint ≈ (8*SQ+frame)/2 columns and rows (X½ + ▀).
-# Default SQ=10 → ~44 terminal cells wide.
-SQ = int(os.environ.get("CHESS_SQ", "10"))
-SQ = max(6, min(SQ, 48))
+SQ = 32   # sprite is 32x32 pixels
 
 def _fg(rgb): return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
 def _bg(rgb): return f"\033[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
 
 
 # ---------------------------------------------------------------------------
-# Procedural textures: marble (veins) and wood (growth rings + grain).
-# One big sheet is baked at init; each square/piece samples a unique offset.
+# Procedural marble texture: value-noise + turbulence for veining.
+# We generate ONE big texture at import time, then slice each square/piece
+# fill from a different offset — cheap, and every square looks natural
+# (no repeating tile pattern).
 # ---------------------------------------------------------------------------
 def _value_noise_2d(h: int, w: int, cell: int, rng) -> np.ndarray:
     """Cheap 2D value noise: random grid of values, bilinear-interpolated.
@@ -382,12 +369,14 @@ def _value_noise_2d(h: int, w: int, cell: int, rng) -> np.ndarray:
     gh = h // cell + 2
     gw = w // cell + 2
     grid = rng.random((gh, gw)).astype(np.float32)
+    # Expand each grid cell with bilinear interpolation
     ys = np.arange(h, dtype=np.float32) / cell
     xs = np.arange(w, dtype=np.float32) / cell
     y0 = ys.astype(np.int32);  y1 = y0 + 1
     x0 = xs.astype(np.int32);  x1 = x0 + 1
     fy = (ys - y0)[:, None]
     fx = (xs - x0)[None, :]
+    # Smoothstep for softer transitions
     fy = fy * fy * (3 - 2 * fy)
     fx = fx * fx * (3 - 2 * fx)
     g00 = grid[np.ix_(y0, x0)]; g10 = grid[np.ix_(y1, x0)]
@@ -397,7 +386,8 @@ def _value_noise_2d(h: int, w: int, cell: int, rng) -> np.ndarray:
     return top * (1 - fy) + bot * fy
 
 def _turbulence(h: int, w: int, rng, octaves: int = 5) -> np.ndarray:
-    """Fractal noise: sum of value-noise at halving scales."""
+    """Fractal noise: sum of value-noise at halving scales, halving amplitudes.
+    The absolute-value + sinusoidal warp on top gives marble its vein look."""
     out = np.zeros((h, w), dtype=np.float32)
     amp = 1.0
     cell = max(h, w) // 2
@@ -405,6 +395,7 @@ def _turbulence(h: int, w: int, rng, octaves: int = 5) -> np.ndarray:
         out += amp * _value_noise_2d(h, w, max(cell, 2), rng)
         amp *= 0.5
         cell = max(cell // 2, 2)
+    # Normalize to [0, 1]
     out = (out - out.min()) / max(out.max() - out.min(), 1e-6)
     return out
 
@@ -428,82 +419,31 @@ def _make_marble(h: int, w: int, base_rgb, dark_rgb, vein_rgb, seed: int,
     out = body * (1 - va) + vein[None, None, :] * va
     return np.clip(out, 0, 255).astype(np.uint8)
 
+# Pre-bake big marble sheets once — slicing per-square from these is cheap
+# and every square looks unique.
+_MARBLE_LIGHT = None
+_MARBLE_DARK  = None
+_MARBLE_WHITE_PIECE = None
+_MARBLE_BLACK_PIECE = None
 
-def _make_wood(h: int, w: int, base_rgb, dark_rgb, grain_rgb, seed: int,
-               ring_freq: float = 14.0, grain_strength: float = 0.55,
-               ring_warp: float = 2.8):
-    """Procedural wood: concentric growth rings + fine longitudinal grain."""
-    rng = np.random.default_rng(seed)
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    cx = w * (0.45 + 0.1 * rng.random())
-    cy = h * (0.40 + 0.2 * rng.random())
-    warp = _turbulence(h, w, rng, octaves=4)
-    dx = (xs - cx) / max(w, 1)
-    dy = (ys - cy) / max(h, 1)
-    r = np.sqrt(dx * dx + dy * dy) + (warp - 0.5) * ring_warp * 0.08
-    rings = np.sin(r * ring_freq * 2.0 * np.pi)
-    rings = 0.5 + 0.5 * rings
-    rings = np.clip(rings ** 1.4, 0, 1)
-    grain_noise = _turbulence(h, w, rng, octaves=6)
-    grain = np.sin((ys / h * 40.0 + grain_noise * 8.0) * np.pi)
-    grain = 0.5 + 0.5 * grain
-    grain = np.clip(grain ** 2.2, 0, 1)
-    base = np.array(base_rgb, dtype=np.float32)
-    dark = np.array(dark_rgb, dtype=np.float32)
-    grain_c = np.array(grain_rgb, dtype=np.float32)
-    body = base[None, None, :] * (1 - rings[..., None]) + \
-           dark[None, None, :] * rings[..., None]
-    ga = grain[..., None] * grain_strength * 0.35
-    out = body * (1 - ga) + grain_c[None, None, :] * ga
-    val = _value_noise_2d(h, w, max(h // 8, 4), rng)
-    out = out * (0.92 + 0.16 * val[..., None])
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-# Pre-baked texture sheets (filled by _init_textures)
-_BOARD_LIGHT = None
-_BOARD_DARK  = None
-_PIECE_LIGHT = None
-_PIECE_DARK  = None
-
-def _init_textures():
-    """Bake board + piece sheets for the active material mode."""
-    global _BOARD_LIGHT, _BOARD_DARK, _PIECE_LIGHT, _PIECE_DARK
-    if _BOARD_LIGHT is not None:
-        return
-    board_h = 8 * SQ + 8
-    board_w = board_h
-    piece_sz = max(SQ * 3, 48)
-    if _MATERIAL == "wood":
-        _BOARD_LIGHT = _make_wood(
-            board_h, board_w, LIGHT_WOOD_BASE, LIGHT_WOOD_DARK, LIGHT_WOOD_GRAIN,
-            seed=31, ring_freq=9.0, grain_strength=0.45, ring_warp=2.4)
-        _BOARD_DARK = _make_wood(
-            board_h, board_w, DARK_WOOD_BASE, DARK_WOOD_DARK, DARK_WOOD_GRAIN,
-            seed=32, ring_freq=10.0, grain_strength=0.40, ring_warp=2.2)
-        _PIECE_LIGHT = _make_wood(
-            piece_sz, piece_sz, LIGHT_WOOD_BASE, LIGHT_WOOD_DARK, LIGHT_WOOD_GRAIN,
-            seed=21, ring_freq=11.0, grain_strength=0.6, ring_warp=3.2)
-        _PIECE_DARK = _make_wood(
-            piece_sz, piece_sz, DARK_WOOD_BASE, DARK_WOOD_DARK, DARK_WOOD_GRAIN,
-            seed=22, ring_freq=13.0, grain_strength=0.5, ring_warp=2.6)
-    else:
-        _BOARD_LIGHT = _make_marble(
-            board_h, board_w, LIGHT_MARBLE_BASE, LIGHT_MARBLE_DARK, LIGHT_VEIN,
-            seed=1, vein_sharpness=16.0, vein_freq=3.5, vein_alpha_max=0.35)
-        _BOARD_DARK = _make_marble(
-            board_h, board_w, DARK_MARBLE_BASE, DARK_MARBLE_DARK, DARK_VEIN,
-            seed=2, vein_sharpness=22.0, vein_freq=4.0, vein_alpha_max=0.30)
-        _PIECE_LIGHT = _make_marble(
-            piece_sz, piece_sz, WP_B, WP_M, WP_VEIN,
-            seed=11, vein_sharpness=16.0, vein_freq=4.0, vein_alpha_max=0.28)
-        _PIECE_DARK = _make_marble(
-            piece_sz, piece_sz, BP_M, BP_S, BP_VEIN,
-            seed=12, vein_sharpness=22.0, vein_freq=4.5, vein_alpha_max=0.22)
-
-# Back-compat alias
 def _init_marble():
-    _init_textures()
+    global _MARBLE_LIGHT, _MARBLE_DARK, _MARBLE_WHITE_PIECE, _MARBLE_BLACK_PIECE
+    if _MARBLE_LIGHT is not None:
+        return
+    board_h = 8 * SQ + 8   # a bit of slack so different offsets differ visually
+    board_w = board_h
+    _MARBLE_LIGHT = _make_marble(
+        board_h, board_w, LIGHT_MARBLE_BASE, LIGHT_MARBLE_DARK, LIGHT_VEIN,
+        seed=1, vein_sharpness=16.0, vein_freq=3.5, vein_alpha_max=0.35)
+    _MARBLE_DARK = _make_marble(
+        board_h, board_w, DARK_MARBLE_BASE, DARK_MARBLE_DARK, DARK_VEIN,
+        seed=2, vein_sharpness=22.0, vein_freq=4.0, vein_alpha_max=0.30)
+    _MARBLE_WHITE_PIECE = _make_marble(
+        SQ * 3, SQ * 3, WP_B, WP_M, WP_VEIN,
+        seed=11, vein_sharpness=16.0, vein_freq=4.0, vein_alpha_max=0.28)
+    _MARBLE_BLACK_PIECE = _make_marble(
+        SQ * 3, SQ * 3, BP_M, BP_S, BP_VEIN,
+        seed=12, vein_sharpness=22.0, vein_freq=4.5, vein_alpha_max=0.22)
 
 # ---- Sprite atlas ---------------------------------------------------------
 # 32x32 grids. Legend:
@@ -717,30 +657,20 @@ SPRITES = {
 }
 
 # Build integer sprite masks once
-_NATIVE_SPRITE = 32   # SPRITES atlas is authored at 32x32
-
 def _compile_sprites():
-    """Parse 32x32 atlas, then nearest-neighbor scale to SQ for TG-16 look."""
     out = {}
     for k, rows in SPRITES.items():
-        m32 = np.zeros((_NATIVE_SPRITE, _NATIVE_SPRITE), dtype=np.int8)
+        # 0=trans, 1=outline O, 2=shadow S, 3=midtone M, 4=base B, 5=highlight H, 6=jewel J
+        m = np.zeros((SQ, SQ), dtype=np.int8)
         for r, row in enumerate(rows):
-            if r >= _NATIVE_SPRITE:
-                break
-            for c, ch in enumerate(row.ljust(_NATIVE_SPRITE)[:_NATIVE_SPRITE]):
-                if   ch == "O": m32[r, c] = 1
-                elif ch == "S": m32[r, c] = 2
-                elif ch == "M": m32[r, c] = 3
-                elif ch == "B": m32[r, c] = 4
-                elif ch == "H": m32[r, c] = 5
-                elif ch == "J": m32[r, c] = 6
-        if SQ == _NATIVE_SPRITE:
-            out[k] = m32
-        else:
-            # Nearest-neighbor scale → crisp 16-bit pixels, no blur
-            ys = (np.arange(SQ) * _NATIVE_SPRITE // SQ)
-            xs = (np.arange(SQ) * _NATIVE_SPRITE // SQ)
-            out[k] = m32[ys][:, xs]
+            for c, ch in enumerate(row.ljust(SQ)[:SQ]):
+                if   ch == "O": m[r, c] = 1
+                elif ch == "S": m[r, c] = 2
+                elif ch == "M": m[r, c] = 3
+                elif ch == "B": m[r, c] = 4
+                elif ch == "H": m[r, c] = 5
+                elif ch == "J": m[r, c] = 6
+        out[k] = m
     return out
 
 _SPRITE_MASKS = None
@@ -750,106 +680,21 @@ def _sprite(kind: str):
         _SPRITE_MASKS = _compile_sprites()
     return _SPRITE_MASKS[kind]
 
-
-# ---------------------------------------------------------------------------
-# 2D 16-bit (TurboGrafx-16 / SNES) board renderer
-#
-# Flat top-down view, crisp nearest-neighbor sprites, bevelled squares,
-# limited-palette feel with dither on dark squares. No perspective, no
-# raytracing — pure pixel art that fits an ~800x800 terminal at SQ=16.
-# ---------------------------------------------------------------------------
-
-# Classic black & white 16-bit piece palettes (high contrast, clear icons).
-# Layers: 1=outline  2=shadow  3=mid  4=body  5=highlight  6=jewel accent
-_PAL_WHITE = {
-    1: (20,  20,  20),      # hard black outline
-    2: (160, 160, 160),     # soft gray shadow
-    3: (210, 210, 210),     # mid gray
-    4: (240, 240, 240),     # near-white body
-    5: (255, 255, 255),     # pure highlight
-    6: (90,  90,  90),      # dark jewel (B&W)
-}
-_PAL_BLACK = {
-    1: (0,    0,   0),      # pure black outline
-    2: (25,  25,  25),      # deep shadow
-    3: (55,  55,  55),      # dark mid
-    4: (85,  85,  85),      # body
-    5: (140, 140, 140),     # highlight so form reads on dark squares
-    6: (200, 200, 200),     # light jewel accent
-}
-
-# Board square colours — pure B&W checkerboard
-_SQ_LIGHT = np.array([232, 232, 232], dtype=np.uint8)   # off-white
-_SQ_DARK  = np.array([ 48,  48,  48], dtype=np.uint8)   # charcoal
-_SQ_LIGHT_BEVEL_HI = (255, 255, 255)
-_SQ_LIGHT_BEVEL_LO = (180, 180, 180)
-_SQ_DARK_BEVEL_HI  = ( 80,  80,  80)
-_SQ_DARK_BEVEL_LO  = ( 15,  15,  15)
-
-
-def _piece_palette(color_white: bool):
-    return _PAL_WHITE if color_white else _PAL_BLACK
-
-
 def _square_pixels(is_light: bool, file: int, rank: int):
-    """Flat B&W square with 16-bit bevel + subtle dither for TG-16 texture."""
-    base = _SQ_LIGHT if is_light else _SQ_DARK
-    px = np.empty((SQ, SQ, 3), dtype=np.uint8)
-    px[:, :] = base
-    # Fine checker dither (classic 16-bit texture, ± 1)
-    for r in range(SQ):
-        for c in range(SQ):
-            if (r + c) & 1:
-                if is_light:
-                    px[r, c] = (224, 224, 224)
-                else:
-                    px[r, c] = (56, 56, 56)
-    # 1px bevel
-    hi = _SQ_LIGHT_BEVEL_HI if is_light else _SQ_DARK_BEVEL_HI
-    lo = _SQ_LIGHT_BEVEL_LO if is_light else _SQ_DARK_BEVEL_LO
-    px[0, :]  = hi
-    px[:, 0]  = hi
-    px[SQ - 1, :] = lo
-    px[:, SQ - 1] = lo
-    px[0, SQ - 1] = tuple((a + b) // 2 for a, b in zip(hi, lo))
-    px[SQ - 1, 0] = tuple((a + b) // 2 for a, b in zip(hi, lo))
+    """Kept for backward-compat / ASCII path — the 3D renderer builds its
+    own board plane and doesn't call this."""
+    _init_marble()
+    sheet = _MARBLE_LIGHT if is_light else _MARBLE_DARK
+    max_off = sheet.shape[0] - SQ
+    y0 = (rank * 7 + file * 13) % (max_off + 1)
+    x0 = (rank * 11 + file * 5 + 3) % (max_off + 1)
+    px = sheet[y0:y0 + SQ, x0:x0 + SQ].copy()
+    px[0, :] = BEVEL_HI;   px[:, 0] = BEVEL_HI
+    px[SQ - 1, :] = BEVEL_LO; px[:, SQ - 1] = BEVEL_LO
     return px
 
-
 def _paint_piece(sq_px, kind, color_white, file, rank):
-    """Composite detailed sprite onto square (in-place). Outline drawn first
-    for a clean 16-bit icon silhouette, then body layers."""
-    mask = _sprite(kind)
-    pal = _piece_palette(color_white)
-    # Two-pass: outline first (so it never gets covered), then body
-    for layer in (1, 2, 3, 4, 5, 6):
-        col = pal[layer]
-        for r in range(SQ):
-            for c in range(SQ):
-                if int(mask[r, c]) == layer:
-                    sq_px[r, c] = col
-    return sq_px
-
-
-def _render_board_2d(board: chess.Board) -> np.ndarray:
-    """Flat 2D black-and-white board with detailed 16-bit piece icons."""
-    H = W = 8 * SQ
-    img = np.zeros((H, W, 3), dtype=np.uint8)
-    for rank in range(8):
-        for file in range(8):
-            is_light = ((rank + file) % 2) == 1
-            sq = _square_pixels(is_light, file, rank)
-            piece = board.piece_at(chess.square(file, rank))
-            if piece:
-                kind = piece.symbol().upper()
-                _paint_piece(sq, kind, piece.color == chess.WHITE, file, rank)
-            y0 = (7 - rank) * SQ
-            x0 = file * SQ
-            img[y0:y0 + SQ, x0:x0 + SQ] = sq
-    frame = 2
-    out = np.full((H + 2 * frame, W + 2 * frame, 3), (20, 20, 20), dtype=np.uint8)
-    out[frame:frame + H, frame:frame + W] = img
-    return out
+    pass  # unused by 3D renderer; kept as a no-op for API compatibility
 
 
 # ---------------------------------------------------------------------------
@@ -1130,37 +975,32 @@ def _compute_normal(prim, hit_pt):
 JEWEL_RUBY     = np.array([185,  40,  50], dtype=np.float32)
 JEWEL_SAPPHIRE = np.array([ 60, 130, 200], dtype=np.float32)
 
-def _sample_piece_at(hit_pt, prim, is_light):
-    """Sample piece texture (wood or marble depending on _MATERIAL).
-
-    Cylindrical UV so grain/rings wrap naturally around each piece body.
-    """
-    _init_textures()
-    sheet = _PIECE_LIGHT if is_light else _PIECE_DARK
+def _sample_marble_at(hit_pt, prim, is_light_marble):
+    """Sample marble color per pixel from the piece marble sheet, indexed by
+    a stable per-piece offset + local UV in the piece's bounding box."""
+    _init_marble()
+    sheet = _MARBLE_WHITE_PIECE if is_light_marble else _MARBLE_BLACK_PIECE
     _f, _rk = prim[-2], prim[-1]
     H, W = sheet.shape[:2]
-    off_y = (_rk * 17 + _f * 23 + 7) % max(H - 8, 1)
-    off_x = (_f  * 29 + _rk * 13 + 5) % max(W - 8, 1)
-    cx = _f + 0.5
-    cz = _rk + 0.5
-    ang = np.arctan2(hit_pt[:, 0] - cx, hit_pt[:, 2] - cz)
-    u = ((ang / (2 * np.pi) + 0.5) * (W // 2) +
-         hit_pt[:, 1] * 4.0).astype(np.int32) % max(W // 2, 1)
-    v = (hit_pt[:, 1] * 18.0 +
-         np.sqrt((hit_pt[:, 0] - cx) ** 2 + (hit_pt[:, 2] - cz) ** 2) * 9.0
-         ).astype(np.int32) % max(H // 2, 1)
+    off_y = (_rk * 17 + _f * 23 + 7) % (H - 8)
+    off_x = (_f  * 29 + _rk * 13 + 5) % (W - 8)
+    # UV: hash-project world (x,y,z) to sheet coords
+    u = ((hit_pt[:, 0] * 2.7 + hit_pt[:, 1] * 4.1) * 6.0).astype(np.int32) % (W // 2)
+    v = ((hit_pt[:, 2] * 2.3 + hit_pt[:, 1] * 3.7) * 6.0).astype(np.int32) % (H // 2)
     ys = np.clip(off_y + v, 0, H - 1)
     xs = np.clip(off_x + u, 0, W - 1)
     return sheet[ys, xs].astype(np.float32)
 
 
-def _sample_board_at(hit_pt):
-    """Sample board texture (wood or marble) with checkerboard light/dark."""
-    _init_textures()
+def _sample_board_marble(hit_pt):
+    """Sample marble color at a board hit — checkerboard picks the sheet."""
+    _init_marble()
     fx = np.clip(np.floor(hit_pt[:, 0]).astype(np.int32), 0, 7)
     fz = np.clip(np.floor(hit_pt[:, 2]).astype(np.int32), 0, 7)
+    # With white near (z=0..1) and black far (z=7..8), the board rank matches z.
     is_light = ((fz + fx) % 2) == 1
-    L = _BOARD_LIGHT; D = _BOARD_DARK
+    # Per-pixel U/V within the marble sheet
+    L = _MARBLE_LIGHT; D = _MARBLE_DARK
     H, W = L.shape[:2]
     u = (hit_pt[:, 0] * (W / 8.0)).astype(np.int32) % W
     v = (hit_pt[:, 2] * (H / 8.0)).astype(np.int32) % H
@@ -1188,25 +1028,22 @@ def _shade(hit_pt, normal, view_dir, base_color, in_shadow,
     return np.clip(out, 0, 255)
 
 
-# --- Main board render (2D 16-bit by default; 3D still available via CHESS_3D=1)
+# --- Camera + main render ---------------------------------------------------
 _RENDER_CACHE = {}   # fen -> rendered numpy array (H, W, 3)
 _RENDER_CACHE_MAX = 32
 
 def _render_board_pixels(board: chess.Board) -> np.ndarray:
-    """Render the current position. Default is flat 2D TurboGrafx-16 style.
-    Set CHESS_3D=1 to use the slow ray-marched 3D path instead.
-    Results are cached by FEN so redraws of the same position are free."""
-    key = (board.board_fen() + (" w" if board.turn else " b")
-           + "|" + _MATERIAL + "|" + ("3d" if os.environ.get("CHESS_3D") else "2d")
-           + f"|sq{SQ}")
+    """Render the current position as a 3D scene. Returns (H, W, 3) uint8.
+    Result is cached by FEN — a full-board raytrace costs ~2s so we don't
+    want to redo it if the same position gets re-drawn (e.g. from a repeat
+    header refresh)."""
+    key = board.board_fen() + (" w" if board.turn else " b")
     cached = _RENDER_CACHE.get(key)
     if cached is not None:
         return cached
-    if os.environ.get("CHESS_3D"):
-        out = _render_board_pixels_impl(board)
-    else:
-        out = _render_board_2d(board)
+    out = _render_board_pixels_impl(board)
     if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
+        # drop oldest (arbitrary — dict is insertion-ordered)
         _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))
     _RENDER_CACHE[key] = out
     return out
@@ -1214,8 +1051,8 @@ def _render_board_pixels(board: chess.Board) -> np.ndarray:
 
 def _render_board_pixels_impl(board: chess.Board) -> np.ndarray:
     """Render the current position as a 3D scene. Returns (H, W, 3) uint8."""
-    _init_textures()
-    H = W = 8 * SQ            # terminal footprint scales with SQ
+    _init_marble()
+    H = W = 8 * SQ            # keep same terminal footprint
 
     # Camera: elevated behind the near edge, looking at the board center.
     cam = np.array([4.0, 6.8, -3.5], dtype=np.float32)
@@ -1251,22 +1088,18 @@ def _render_board_pixels_impl(board: chess.Board) -> np.ndarray:
     # ---- Board hits (idx == -2) ----
     mb = idx == -2
     if mb.any():
-        base = _sample_board_at(hit_pt[mb])
+        base = _sample_board_marble(hit_pt[mb])
         normal = np.zeros((mb.sum(), 3), dtype=np.float32)
         normal[:, 1] = 1.0
         light_dir = np.array([-0.5, 0.85, -0.2], dtype=np.float32)
         light_dir /= np.linalg.norm(light_dir)
         light_dir_b = np.broadcast_to(light_dir, normal.shape)
+        # Board is always facing up; light has +Y component -> always front-lit.
         in_sh = _shadow_ray(hit_pt[mb], light_dir_b, prims)
         view_dir = -rd[mb]
-        if _MATERIAL == "wood":
-            img[mb] = _shade(hit_pt[mb], normal, view_dir, base, in_sh,
-                             light_dir_b, specular_pow=24.0,
-                             specular_strength=0.10, ambient=0.50)
-        else:
-            img[mb] = _shade(hit_pt[mb], normal, view_dir, base, in_sh,
-                             light_dir_b, specular_pow=48.0,
-                             specular_strength=0.15, ambient=0.55)
+        img[mb] = _shade(hit_pt[mb], normal, view_dir, base, in_sh,
+                         light_dir_b, specular_pow=48.0,
+                         specular_strength=0.15, ambient=0.55)
 
     # ---- Piece hits (idx >= 0) ----
     hit_piece = idx >= 0
@@ -1294,17 +1127,11 @@ def _render_board_pixels_impl(board: chess.Board) -> np.ndarray:
                 base = np.broadcast_to(JEWEL_SAPPHIRE, (hp.shape[0], 3)).astype(np.float32)
                 spec_pow, spec_str, amb = 128.0, 0.7, 0.25
             elif mat == "W":
-                base = _sample_piece_at(hp, p, is_light=True)
-                if _MATERIAL == "wood":
-                    spec_pow, spec_str, amb = 32.0, 0.22, 0.38   # satin oak
-                else:
-                    spec_pow, spec_str, amb = 64.0, 0.35, 0.35   # polished marble
+                base = _sample_marble_at(hp, p, is_light_marble=True)
+                spec_pow, spec_str, amb = 64.0, 0.35, 0.35
             else:
-                base = _sample_piece_at(hp, p, is_light=False)
-                if _MATERIAL == "wood":
-                    spec_pow, spec_str, amb = 28.0, 0.18, 0.28   # satin walnut
-                else:
-                    spec_pow, spec_str, amb = 64.0, 0.30, 0.20
+                base = _sample_marble_at(hp, p, is_light_marble=False)
+                spec_pow, spec_str, amb = 64.0, 0.30, 0.20
             view_dir = -rd[mask]
             img[mask] = _shade(hp, normal, view_dir, base, in_sh, ld_b,
                                specular_pow=spec_pow,
