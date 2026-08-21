@@ -362,11 +362,11 @@ DARK_WOOD_GRAIN  = ( 90,  55,  30)   # lighter grain highlights
 _MATERIAL = os.environ.get("CHESS_MATERIAL", "wood").strip().lower()
 if _MATERIAL not in ("wood", "marble"):
     _MATERIAL = "wood"
-# SQ = pixels per square edge in the raytraced image.
+# SQ = pixels per square edge in the rendered image.
 # Terminal footprint ≈ (8*SQ+frame)/2 columns and rows (X½ + ▀).
-# SQ=16 → ~70×70 cells → fits an ~800×800 terminal window.
-SQ = int(os.environ.get("CHESS_SQ", "16"))
-SQ = max(8, min(SQ, 48))
+# Default SQ=10 → ~44×44 cells (about 1/3 smaller than the old SQ=16 default).
+SQ = int(os.environ.get("CHESS_SQ", "10"))
+SQ = max(6, min(SQ, 48))
 
 def _fg(rgb): return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
 def _bg(rgb): return f"\033[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
