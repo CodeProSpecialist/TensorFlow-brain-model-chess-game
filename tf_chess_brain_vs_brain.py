@@ -313,20 +313,1005 @@ def choose_move(brain: Model, board: chess.Board, temperature: float = 0.4,
 
 
 # ---------------------------------------------------------------------------
-# Terminal rendering
+# Terminal rendering — SNES/16-bit pixel-art style using 24-bit truecolor
 # ---------------------------------------------------------------------------
+# Marble palette. Real marble has three visual layers:
+#   1. A base tone (creamy off-white for Carrara, deep charcoal for Nero)
+#   2. Subtle low-frequency shading (large soft gradients from mineral density)
+#   3. Sharp high-frequency veins (calcite/quartz threads winding through)
+# We synthesize (2) with cheap value-noise and (3) with a "turbulence" pattern.
+# ---------------------------------------------------------------------------
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+# Carrara-style light marble: warm cream base, faint gray veins
+LIGHT_MARBLE_BASE = (245, 240, 230)
+LIGHT_MARBLE_DARK = (220, 213, 200)   # subtle shading, not stormy
+LIGHT_VEIN        = (135, 128, 118)   # medium gray veins
+# Nero Marquina-style dark marble: near-black base, sharp white veins
+DARK_MARBLE_BASE  = ( 32,  28,  26)
+DARK_MARBLE_DARK  = ( 15,  12,  11)
+DARK_VEIN         = (200, 195, 185)   # bright calcite veins
+
+BEVEL_HI    = (255, 245, 225)   # crisp top/left edge (polished stone)
+BEVEL_LO    = ( 15,  10,   8)   # near-black bottom/right edge
+BORDER      = ( 25,  20,  18)   # frame around board
+LABEL_BG    = ( 15,  10,   8)
+LABEL_FG    = (230, 220, 200)
+
+# Piece / board material palette.
+# Mode: CHESS_MATERIAL=wood|marble (default wood).
+#   wood   → light-oak / dark-walnut pieces + matching wood board
+#   marble → Carrara / Nero Marquina pieces + matching marble board
+WP_O = ( 55,  50,  45); WP_S = (165, 155, 140); WP_M = (215, 208, 195)
+WP_B = (240, 233, 220); WP_H = (255, 252, 245); WP_J = (185,  40,  50)  # deep ruby
+BP_O = (  0,   0,   0); BP_S = ( 12,  10,  10); BP_M = ( 42,  38,  38)
+BP_B = ( 78,  72,  72); BP_H = (140, 130, 130); BP_J = ( 60, 130, 200)  # deep sapphire
+WP_VEIN = ( 90,  85,  80)
+BP_VEIN = (210, 205, 195)
+
+# Wood colours (pieces + board when material == "wood")
+LIGHT_WOOD_BASE  = (210, 170, 110)   # honey oak
+LIGHT_WOOD_DARK  = (160, 115,  65)   # deeper oak rings
+LIGHT_WOOD_GRAIN = (120,  80,  40)   # fine dark grain lines
+DARK_WOOD_BASE   = ( 55,  32,  18)   # walnut body
+DARK_WOOD_DARK   = ( 28,  16,   8)   # near-ebony rings
+DARK_WOOD_GRAIN  = ( 90,  55,  30)   # lighter grain highlights
+
+# Material mode + render size (fit ~800x800 GNOME terminal by default)
+_MATERIAL = os.environ.get("CHESS_MATERIAL", "wood").strip().lower()
+if _MATERIAL not in ("wood", "marble"):
+    _MATERIAL = "wood"
+# SQ = pixels per square edge in the raytraced image.
+# Terminal footprint ≈ (8*SQ+frame)/2 columns and rows (X½ + ▀).
+# SQ=16 → ~70×70 cells → fits an ~800×800 terminal window.
+SQ = int(os.environ.get("CHESS_SQ", "16"))
+SQ = max(8, min(SQ, 48))
+
+def _fg(rgb): return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+def _bg(rgb): return f"\033[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+# ---------------------------------------------------------------------------
+# Procedural textures: marble (veins) and wood (growth rings + grain).
+# One big sheet is baked at init; each square/piece samples a unique offset.
+# ---------------------------------------------------------------------------
+def _value_noise_2d(h: int, w: int, cell: int, rng) -> np.ndarray:
+    """Cheap 2D value noise: random grid of values, bilinear-interpolated.
+    Returns a (h, w) float array in [0, 1]."""
+    gh = h // cell + 2
+    gw = w // cell + 2
+    grid = rng.random((gh, gw)).astype(np.float32)
+    ys = np.arange(h, dtype=np.float32) / cell
+    xs = np.arange(w, dtype=np.float32) / cell
+    y0 = ys.astype(np.int32);  y1 = y0 + 1
+    x0 = xs.astype(np.int32);  x1 = x0 + 1
+    fy = (ys - y0)[:, None]
+    fx = (xs - x0)[None, :]
+    fy = fy * fy * (3 - 2 * fy)
+    fx = fx * fx * (3 - 2 * fx)
+    g00 = grid[np.ix_(y0, x0)]; g10 = grid[np.ix_(y1, x0)]
+    g01 = grid[np.ix_(y0, x1)]; g11 = grid[np.ix_(y1, x1)]
+    top = g00 * (1 - fx) + g01 * fx
+    bot = g10 * (1 - fx) + g11 * fx
+    return top * (1 - fy) + bot * fy
+
+def _turbulence(h: int, w: int, rng, octaves: int = 5) -> np.ndarray:
+    """Fractal noise: sum of value-noise at halving scales."""
+    out = np.zeros((h, w), dtype=np.float32)
+    amp = 1.0
+    cell = max(h, w) // 2
+    for _ in range(octaves):
+        out += amp * _value_noise_2d(h, w, max(cell, 2), rng)
+        amp *= 0.5
+        cell = max(cell // 2, 2)
+    out = (out - out.min()) / max(out.max() - out.min(), 1e-6)
+    return out
+
+def _make_marble(h: int, w: int, base_rgb, dark_rgb, vein_rgb, seed: int,
+                 vein_sharpness: float = 8.0, vein_freq: float = 1.5,
+                 vein_alpha_max: float = 0.4):
+    """Return an (h, w, 3) uint8 marble texture."""
+    rng = np.random.default_rng(seed)
+    base_noise = _turbulence(h, w, rng, octaves=4)
+    turb = _turbulence(h, w, rng, octaves=5)
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    coord = (xs / w + 0.5 * ys / h) * (vein_freq * 2 * np.pi) + turb * 6.0
+    vein_mask = np.abs(np.sin(coord))
+    vein_mask = np.clip(vein_mask ** vein_sharpness, 0, 1)
+    base = np.array(base_rgb, dtype=np.float32)
+    dark = np.array(dark_rgb, dtype=np.float32)
+    vein = np.array(vein_rgb, dtype=np.float32)
+    body = base[None, None, :] * base_noise[..., None] + \
+           dark[None, None, :] * (1 - base_noise[..., None])
+    va = (1.0 - vein_mask)[..., None] * vein_alpha_max
+    out = body * (1 - va) + vein[None, None, :] * va
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _make_wood(h: int, w: int, base_rgb, dark_rgb, grain_rgb, seed: int,
+               ring_freq: float = 14.0, grain_strength: float = 0.55,
+               ring_warp: float = 2.8):
+    """Procedural wood: concentric growth rings + fine longitudinal grain."""
+    rng = np.random.default_rng(seed)
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx = w * (0.45 + 0.1 * rng.random())
+    cy = h * (0.40 + 0.2 * rng.random())
+    warp = _turbulence(h, w, rng, octaves=4)
+    dx = (xs - cx) / max(w, 1)
+    dy = (ys - cy) / max(h, 1)
+    r = np.sqrt(dx * dx + dy * dy) + (warp - 0.5) * ring_warp * 0.08
+    rings = np.sin(r * ring_freq * 2.0 * np.pi)
+    rings = 0.5 + 0.5 * rings
+    rings = np.clip(rings ** 1.4, 0, 1)
+    grain_noise = _turbulence(h, w, rng, octaves=6)
+    grain = np.sin((ys / h * 40.0 + grain_noise * 8.0) * np.pi)
+    grain = 0.5 + 0.5 * grain
+    grain = np.clip(grain ** 2.2, 0, 1)
+    base = np.array(base_rgb, dtype=np.float32)
+    dark = np.array(dark_rgb, dtype=np.float32)
+    grain_c = np.array(grain_rgb, dtype=np.float32)
+    body = base[None, None, :] * (1 - rings[..., None]) + \
+           dark[None, None, :] * rings[..., None]
+    ga = grain[..., None] * grain_strength * 0.35
+    out = body * (1 - ga) + grain_c[None, None, :] * ga
+    val = _value_noise_2d(h, w, max(h // 8, 4), rng)
+    out = out * (0.92 + 0.16 * val[..., None])
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# Pre-baked texture sheets (filled by _init_textures)
+_BOARD_LIGHT = None
+_BOARD_DARK  = None
+_PIECE_LIGHT = None
+_PIECE_DARK  = None
+
+def _init_textures():
+    """Bake board + piece sheets for the active material mode."""
+    global _BOARD_LIGHT, _BOARD_DARK, _PIECE_LIGHT, _PIECE_DARK
+    if _BOARD_LIGHT is not None:
+        return
+    board_h = 8 * SQ + 8
+    board_w = board_h
+    piece_sz = max(SQ * 3, 48)
+    if _MATERIAL == "wood":
+        _BOARD_LIGHT = _make_wood(
+            board_h, board_w, LIGHT_WOOD_BASE, LIGHT_WOOD_DARK, LIGHT_WOOD_GRAIN,
+            seed=31, ring_freq=9.0, grain_strength=0.45, ring_warp=2.4)
+        _BOARD_DARK = _make_wood(
+            board_h, board_w, DARK_WOOD_BASE, DARK_WOOD_DARK, DARK_WOOD_GRAIN,
+            seed=32, ring_freq=10.0, grain_strength=0.40, ring_warp=2.2)
+        _PIECE_LIGHT = _make_wood(
+            piece_sz, piece_sz, LIGHT_WOOD_BASE, LIGHT_WOOD_DARK, LIGHT_WOOD_GRAIN,
+            seed=21, ring_freq=11.0, grain_strength=0.6, ring_warp=3.2)
+        _PIECE_DARK = _make_wood(
+            piece_sz, piece_sz, DARK_WOOD_BASE, DARK_WOOD_DARK, DARK_WOOD_GRAIN,
+            seed=22, ring_freq=13.0, grain_strength=0.5, ring_warp=2.6)
+    else:
+        _BOARD_LIGHT = _make_marble(
+            board_h, board_w, LIGHT_MARBLE_BASE, LIGHT_MARBLE_DARK, LIGHT_VEIN,
+            seed=1, vein_sharpness=16.0, vein_freq=3.5, vein_alpha_max=0.35)
+        _BOARD_DARK = _make_marble(
+            board_h, board_w, DARK_MARBLE_BASE, DARK_MARBLE_DARK, DARK_VEIN,
+            seed=2, vein_sharpness=22.0, vein_freq=4.0, vein_alpha_max=0.30)
+        _PIECE_LIGHT = _make_marble(
+            piece_sz, piece_sz, WP_B, WP_M, WP_VEIN,
+            seed=11, vein_sharpness=16.0, vein_freq=4.0, vein_alpha_max=0.28)
+        _PIECE_DARK = _make_marble(
+            piece_sz, piece_sz, BP_M, BP_S, BP_VEIN,
+            seed=12, vein_sharpness=22.0, vein_freq=4.5, vein_alpha_max=0.22)
+
+# Back-compat alias
+def _init_marble():
+    _init_textures()
+
+# ---- Sprite atlas ---------------------------------------------------------
+# 32x32 grids. Legend:
+#   '.' transparent   'O' outline    'S' shadow
+#   'M' midtone body  'B' base       'H' highlight    'J' jewel accent
+SPRITES = {
+    "P": (
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        ".............OOOOO..............",
+        "............OSMMMSO.............",
+        "...........OSMBBBMSO............",
+        "...........OMBBHBBMO............",
+        "...........OMBBBBBMO............",
+        "............OSMMMSO.............",
+        ".............OOOOO..............",
+        "...........OSMMMMMSO............",
+        "..........OSMBBBBBMSO...........",
+        ".........OSMBBHHHBBMSO..........",
+        ".........OMBBBBBBBBBMO..........",
+        "..........OSMBBBBBMSO...........",
+        "...........OSMMMMMSO............",
+        "..........OOOOOOOOOOO...........",
+        ".........OSMMMMMMMMMSO..........",
+        "........OSMBBBBBBBBBBMSO........",
+        ".......OSMBBHHHHHBBBBBMSO.......",
+        ".......OMBBBBBBBBBBBBBMO........",
+        ".......OMBBBBBBBBBBBBBMO........",
+        ".......OSMMBBBBBBBBBBMMSO.......",
+        "........OSMMMMMMMMMMMMSO........",
+        ".......OSSSSSSSSSSSSSSSSO.......",
+        "......OSMMMMMMMMMMMMMMMMMSO.....",
+        ".....OMBBBHHHHHBBBBBBBBBBBBMO...",
+        ".....OMBBBBBBBBBBBBBBBBBBBBMO...",
+        ".....OSMMMMMMMMMMMMMMMMMMMMSO...",
+        ".....OOOOOOOOOOOOOOOOOOOOOOOO...",
+        "................................",
+    ),
+    "N": (
+        "................................",
+        "................................",
+        "..............OOOOO.............",
+        ".............OSMMMMOO...........",
+        "............OSMBBBBMOO..........",
+        "...........OSMBBHHBBMO..........",
+        "..........OSMBBHHHHBBMO.........",
+        ".........OSMBBBBHHHHBBMO........",
+        ".........OMBBBBBBHHHBBBMO.......",
+        "........OSMBBBBBBBHHBBBMO.......",
+        "........OMMMMBBBBBBBBBBBMO......",
+        "........OMOOMMMMMBBBBBBBMO......",
+        ".......OMOSSMMMMSMMMBBBBBMO.....",
+        ".......OMOSMSMMSMMMMMBBBBBMO....",
+        ".......OOOOSMSMSMMMMMMMBBBMO....",
+        "..........OSMMSMMMMMMMMBBBMO....",
+        "..........OSMBSMSMMMMMMMBBBMO...",
+        ".........OMBBBBSMMMMMMMMBBBMO...",
+        ".........OMBBHHBBSMMMMMMBBBMO...",
+        "........OMBBHHHHBBBBMMMMBBBBMO..",
+        "........OMBBBHHHHBBBBBMMMBBBBMO.",
+        "........OMBBBBHHHBBBBBBBBBBBBMO.",
+        "........OMBBBBBBBBBBBBBBBBBBBMO.",
+        ".......OMBBBBBBBBBBBBBBBBBBBBBMO",
+        ".......OMBBBBBBBBBBBBBBBBBBBBBMO",
+        ".......OSMMMMMMMMMMMMMMMMMMMMMSO",
+        "......OSMMBBBBBBBBBBBBBBBBBBBMMO",
+        "......OMBBBHHHHHBBBBBBBBBBBBBBMO",
+        "......OMBBBBBBBBBBBBBBBBBBBBBBMO",
+        ".....OMMSSSSSSSSSSSSSSSSSSSSSSMO",
+        ".....OOOOOOOOOOOOOOOOOOOOOOOOOOO",
+        "................................",
+    ),
+    "B": (
+        "................................",
+        "................................",
+        "...............OOO..............",
+        "..............OJJJO.............",
+        ".............OOJJJOO............",
+        ".............OJJOJJO............",
+        ".............OJJJJJO............",
+        ".............OOJJJOO............",
+        "..............OJJJO.............",
+        "..............OOOOO.............",
+        "............OSMMMMMSO...........",
+        "...........OSMBBBBBMSO..........",
+        "..........OSMBBHHHBBBMO.........",
+        ".........OSMBBBHHHBBBBMO........",
+        ".........OMBBBHHHHHBBBBMO.......",
+        ".........OMBBBBHHHBBBBBMO.......",
+        "........OSMBBBBBBBBBBBBMO.......",
+        "........OMBBBBBBBBBBBBBMSO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OSMMBBBBBBBBBBBMSO......",
+        ".........OSMMMMMMMMMMMMSO.......",
+        "..........OOOOOOOOOOOOOO........",
+        ".........OSMMMMMMMMMMMMMSO......",
+        "........OSMBBBBBBBBBBBBBBMO.....",
+        ".......OSMBBBHHHHHBBBBBBBBMO....",
+        ".......OMBBBBBBBBBBBBBBBBBMO....",
+        ".......OMBBBBBBBBBBBBBBBBBMO....",
+        "......OSMMMMMMMMMMMMMMMMMMMSO...",
+        "......OSSSSSSSSSSSSSSSSSSSSSSO..",
+        ".....OMBBBHHHHHBBBBBBBBBBBBBBMO.",
+        ".....OMBBBBBBBBBBBBBBBBBBBBBBMO.",
+        ".....OOOOOOOOOOOOOOOOOOOOOOOOOO.",
+    ),
+    "R": (
+        "................................",
+        "................................",
+        "................................",
+        ".......OOO..OOO..OOO..OOO.......",
+        ".......OMO..OMO..OMO..OMO.......",
+        ".......OMOOOOMOOOOMOOOOMO.......",
+        ".......OMMMMMMMMMMMMMMMMMO......",
+        ".......OMBBBBBBBBBBBBBBBBMO.....",
+        ".......OMBHHHHHHHBBBBBBBBMO.....",
+        ".......OMBBBBBBBBBBBBBBBBMO.....",
+        ".......OSMMMMMMMMMMMMMMMMSO.....",
+        "........OOOOOOOOOOOOOOOOOO......",
+        "........OSMMMMMMMMMMMMMMSO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBHHHHHHBBBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBBBBHHHHHBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OSMMMMMMMMMMMMMMSO......",
+        ".........OOOOOOOOOOOOOOOO.......",
+        ".......OSMMMMMMMMMMMMMMMMMMSO...",
+        ".......OMBBBBBBBBBBBBBBBBBBBMO..",
+        ".......OMBBHHHHHHHBBBBBBBBBBMO..",
+        ".......OMBBBBBBBBBBBBBBBBBBBMO..",
+        ".......OSSSSSSSSSSSSSSSSSSSSSO..",
+        "......OMBBHHHHHHHBBBBBBBBBBBBMO.",
+        "......OOOOOOOOOOOOOOOOOOOOOOOOO.",
+    ),
+    "Q": (
+        "................................",
+        "......O.....O.....O.....O.......",
+        ".....OJO...OJO...OJO...OJO......",
+        ".....OJO...OJO...OJO...OJO......",
+        ".....OJO...OJO...OJO...OJO......",
+        ".....OJOOOOOJOOOOOJOOOOOJO......",
+        ".....OJJJJJJJJJJJJJJJJJJJJO.....",
+        ".....OMMMMMMMMMMMMMMMMMMMMO.....",
+        ".....OMBHHBBBHHBBBHHBBBHHBMO....",
+        ".....OMBBBBBBBBBBBBBBBBBBBMO....",
+        ".....OSMBBBBBBBBBBBBBBBBBMSO....",
+        "......OSMMBBBBBBBBBBBBBMMSO.....",
+        ".......OSMMMBBBBBBBBBMMMSO......",
+        "........OSMMMMBBBBBMMMMSO.......",
+        ".........OSMMMMBBBMMMMSO........",
+        "..........OSMMMMMMMMMSO.........",
+        "..........OOOOOOOOOOOOO.........",
+        "..........OSMMMMMMMMMSO.........",
+        ".........OSMBBBBBBBBBBMSO.......",
+        "........OSMBBBHHHHHBBBBMSO......",
+        ".......OSMBBBBBHHHBBBBBBMSO.....",
+        ".......OMBBHHBBBBBBBBHHBBMO.....",
+        ".......OMBBBBBBBBBBBBBBBBMO.....",
+        ".......OSMBBBBBBBBBBBBBBMSO.....",
+        "........OSMMMMMMMMMMMMMMSO......",
+        "........OSSSSSSSSSSSSSSSSO......",
+        "......OMBBBHHHHHBBBBBBBBBBMO....",
+        "......OMBBBBBBBBBBBBBBBBBBMO....",
+        ".....OSMMMMMMMMMMMMMMMMMMMMSO...",
+        ".....OSSSSSSSSSSSSSSSSSSSSSSO...",
+        "....OMBHHHHHHHBBBBBBBBBBBBBBMO..",
+        "....OOOOOOOOOOOOOOOOOOOOOOOOOO..",
+    ),
+    "K": (
+        "................................",
+        "................................",
+        "..............OOOOO.............",
+        ".............OJJJJJO............",
+        ".............OJJJJJO............",
+        ".........OOOOOJJJJJOOOOO........",
+        ".........OJJJJJJJJJJJJJO........",
+        ".........OJJJJJJJJJJJJJO........",
+        ".........OOOOOOJJJOOOOOO........",
+        ".............OSMMMSO............",
+        "............OSMBBBMSO...........",
+        "...........OSMMBBBMMSO..........",
+        "..........OSMBBHHHBBMSO.........",
+        ".........OSMBBBHHHBBBMSO........",
+        ".........OMBBBBHHHBBBBMO........",
+        ".........OMBBBBBBBBBBBMO........",
+        ".........OSMBBBBBBBBBMSO........",
+        "..........OSMMBBBBBMMSO.........",
+        "...........OSMMMMMMMSO..........",
+        "..........OSMMMMMMMMMSO.........",
+        ".........OSMBBBBBBBBBBMSO.......",
+        "........OSMBBHHHHHHHBBBMSO......",
+        "........OMBBBHHHHHHHHBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OMBBBBBBBBBBBBBBMO......",
+        "........OSMMMMMMMMMMMMMMSO......",
+        ".......OSMMMMMMMMMMMMMMMMSO.....",
+        "......OSMBBBBBBBBBBBBBBBBBMO....",
+        "......OMBBHHHHHHHBBBBBBBBBMO....",
+        "......OSSSSSSSSSSSSSSSSSSSSO....",
+        ".....OMBBHHHHHHHHBBBBBBBBBBMO...",
+        ".....OOOOOOOOOOOOOOOOOOOOOOOO...",
+    ),
+}
+
+# Build integer sprite masks once
+def _compile_sprites():
+    out = {}
+    for k, rows in SPRITES.items():
+        # 0=trans, 1=outline O, 2=shadow S, 3=midtone M, 4=base B, 5=highlight H, 6=jewel J
+        m = np.zeros((SQ, SQ), dtype=np.int8)
+        for r, row in enumerate(rows):
+            for c, ch in enumerate(row.ljust(SQ)[:SQ]):
+                if   ch == "O": m[r, c] = 1
+                elif ch == "S": m[r, c] = 2
+                elif ch == "M": m[r, c] = 3
+                elif ch == "B": m[r, c] = 4
+                elif ch == "H": m[r, c] = 5
+                elif ch == "J": m[r, c] = 6
+        out[k] = m
+    return out
+
+_SPRITE_MASKS = None
+def _sprite(kind: str):
+    global _SPRITE_MASKS
+    if _SPRITE_MASKS is None:
+        _SPRITE_MASKS = _compile_sprites()
+    return _SPRITE_MASKS[kind]
+
+def _square_pixels(is_light: bool, file: int, rank: int):
+    """Kept for backward-compat — the 3D renderer builds its own board plane."""
+    _init_textures()
+    sheet = _BOARD_LIGHT if is_light else _BOARD_DARK
+    max_off = max(sheet.shape[0] - SQ, 0)
+    y0 = (rank * 7 + file * 13) % (max_off + 1)
+    x0 = (rank * 11 + file * 5 + 3) % (max_off + 1)
+    px = sheet[y0:y0 + SQ, x0:x0 + SQ].copy()
+    px[0, :] = BEVEL_HI;   px[:, 0] = BEVEL_HI
+    px[SQ - 1, :] = BEVEL_LO; px[:, SQ - 1] = BEVEL_LO
+    return px
+
+def _paint_piece(sq_px, kind, color_white, file, rank):
+    pass  # unused by 3D renderer; kept as a no-op for API compatibility
+
+
+# ---------------------------------------------------------------------------
+# 3D RENDERER — ray-marched primitives, Lambertian + specular shading,
+# cast shadows onto the marble board.
+#
+# Coordinate frame (right-handed):
+#   +x = file direction (a -> h)      board spans x in [0, 8]
+#   +z = rank direction (1 -> 8)      board spans z in [0, 8]
+#   +y = up                            board plane at y = 0
+#
+# Piece origin is centered on its square: (file + 0.5, 0, rank + 0.5).
+# All piece heights are expressed as multiples of one square edge (=1.0).
+# ---------------------------------------------------------------------------
+
+# --- Primitive intersections (all return t along ray or np.inf) ------------
+def _isect_plane_y(ro, rd, y):
+    """Ray vs horizontal plane y=const. ro/rd shape (...,3)."""
+    dy = rd[..., 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = (y - ro[..., 1]) / dy
+    t = np.where((dy < -1e-6) & (t > 1e-4), t, np.inf)
+    return t
+
+def _isect_sphere(ro, rd, center, radius):
+    """Ray vs sphere. center shape (3,), radius scalar."""
+    oc = ro - center
+    b = np.einsum("...i,...i->...", oc, rd)
+    c = np.einsum("...i,...i->...", oc, oc) - radius * radius
+    disc = b * b - c
+    hit = disc > 0
+    sq = np.sqrt(np.where(hit, disc, 0))
+    t0 = -b - sq
+    t1 = -b + sq
+    t = np.where((t0 > 1e-4) & hit, t0, np.inf)
+    t = np.where((t == np.inf) & (t1 > 1e-4) & hit, t1, t)
+    return t
+
+def _isect_cylinder_y(ro, rd, cx, cz, radius, y_min, y_max):
+    """Ray vs finite Y-axis cylinder. Returns t and whether the hit was on
+    the side (True) or a cap (False) — we use this to compute the correct
+    normal. Cheap: no caps rendered separately unless the ray misses the
+    side."""
+    dx = rd[..., 0]; dz = rd[..., 2]
+    ox = ro[..., 0] - cx; oz = ro[..., 2] - cz
+    a = dx * dx + dz * dz
+    b = ox * dx + oz * dz
+    c = ox * ox + oz * oz - radius * radius
+    disc = b * b - a * c
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sq = np.sqrt(np.where(disc > 0, disc, 0))
+        t_side = (-b - sq) / np.where(a > 1e-12, a, 1e-12)
+    y_at = ro[..., 1] + t_side * rd[..., 1]
+    t_side = np.where((disc > 0) & (t_side > 1e-4) &
+                      (y_at >= y_min) & (y_at <= y_max),
+                      t_side, np.inf)
+    # Cap intersections (top only — bottom is inside the board)
+    t_top = _isect_plane_y(ro, rd, y_max)
+    x_at = ro[..., 0] + t_top * rd[..., 0]
+    z_at = ro[..., 2] + t_top * rd[..., 2]
+    inside = (x_at - cx) ** 2 + (z_at - cz) ** 2 <= radius * radius
+    t_top = np.where(inside & (t_top < np.inf), t_top, np.inf)
+    return np.minimum(t_side, t_top), t_side <= t_top  # (t, is_side)
+
+def _isect_cone_y(ro, rd, cx, cz, y_base, y_top, r_base, r_top):
+    """Ray vs finite truncated cone along Y (frustum). Returns t (or inf).
+    Solves the quadratic in cross-section radius r(y) = r_base + (y - y_base)/
+    (y_top - y_base) * (r_top - r_base)."""
+    dx = rd[..., 0]; dy = rd[..., 1]; dz = rd[..., 2]
+    ox = ro[..., 0] - cx; oy = ro[..., 1] - y_base; oz = ro[..., 2] - cz
+    h = y_top - y_base
+    k = (r_top - r_base) / h              # radius slope
+    # r(y) = r_base + k*(y - y_base). At intersection: x^2 + z^2 = r(y)^2
+    # Let y = oy + t*dy, ry = r_base + k*(oy + t*dy)
+    A = dx * dx + dz * dz - k * k * dy * dy
+    B = ox * dx + oz * dz - k * dy * (r_base + k * oy)
+    C = ox * ox + oz * oz - (r_base + k * oy) ** 2
+    disc = B * B - A * C
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sq = np.sqrt(np.where(disc > 0, disc, 0))
+        t0 = (-B - sq) / np.where(np.abs(A) > 1e-12, A, 1e-12)
+        t1 = (-B + sq) / np.where(np.abs(A) > 1e-12, A, 1e-12)
+    def _keep(t):
+        y_at = ro[..., 1] + t * dy
+        return np.where((disc > 0) & (t > 1e-4) &
+                        (y_at >= y_base) & (y_at <= y_top), t, np.inf)
+    t0 = _keep(t0); t1 = _keep(t1)
+    return np.minimum(t0, t1)
+
+def _isect_torus_approx(ro, rd, cx, cy, cz, R, r):
+    """Cheap 'torus' fake: bounding sphere with a null band. Not used —
+    listed here so it's obvious we picked spheres/cylinders instead."""
+    return np.inf
+
+# --- Piece assembly --------------------------------------------------------
+# Each piece is a list of primitives:
+#   ("sphere", (dx,dy,dz), radius)
+#   ("cyl",    (dx,dz), radius, y_min, y_max)
+#   ("cone",   (dx,dz), y_base, y_top, r_base, r_top)
+# All coordinates are relative to the square center at (fx, 0, fz).
+def _piece_primitives(kind: str):
+    # Common base for every piece: a wide short cylinder
+    base = ("cyl", (0.0, 0.0), 0.34, 0.0, 0.10)
+    plinth = ("cone", (0.0, 0.0), 0.10, 0.14, 0.34, 0.30)
+    if kind == "P":
+        return [
+            base, plinth,
+            ("cone", (0.0, 0.0), 0.14, 0.42, 0.28, 0.14),   # body
+            ("sphere", (0.0, 0.50, 0.0), 0.13),              # head
+        ]
+    if kind == "R":
+        return [
+            base, plinth,
+            ("cyl", (0.0, 0.0), 0.24, 0.14, 0.62),           # tower
+            ("cyl", (0.0, 0.0), 0.28, 0.60, 0.72),           # top ring
+            # Crenellations: 4 small cubes-approx as small cylinders
+            ("cyl", ( 0.16, 0.00), 0.06, 0.72, 0.82),
+            ("cyl", (-0.16, 0.00), 0.06, 0.72, 0.82),
+            ("cyl", ( 0.00, 0.16), 0.06, 0.72, 0.82),
+            ("cyl", ( 0.00,-0.16), 0.06, 0.72, 0.82),
+        ]
+    if kind == "N":  # knight — stylized L-shaped head
+        return [
+            base, plinth,
+            ("cone", (0.0, 0.0), 0.14, 0.50, 0.28, 0.18),   # body/neck
+            # Horse head: an elongated sphere (approx w/ two spheres)
+            ("sphere", (0.00, 0.62,  0.00), 0.20),
+            ("sphere", (0.00, 0.68, -0.16), 0.16),           # muzzle forward
+            ("sphere", (0.00, 0.74, -0.24), 0.10),           # nose tip
+            ("sphere", (0.00, 0.82,  0.08), 0.09),           # mane bump
+        ]
+    if kind == "B":
+        return [
+            base, plinth,
+            ("cone", (0.0, 0.0), 0.14, 0.54, 0.26, 0.16),   # body
+            ("cyl", (0.0, 0.0), 0.18, 0.54, 0.58),           # collar
+            ("sphere", (0.0, 0.72, 0.0), 0.14),              # mitre body
+            ("sphere", (0.0, 0.86, 0.0), 0.05),              # orb on top
+        ]
+    if kind == "Q":
+        return [
+            base, plinth,
+            ("cone", (0.0, 0.0), 0.14, 0.60, 0.28, 0.16),   # body
+            ("cyl", (0.0, 0.0), 0.22, 0.60, 0.66),           # crown base
+            # Ring of 5 jewel spheres on the crown
+            ("sphere", (0.00, 0.76, 0.00),  0.06),
+            ("sphere", (0.15, 0.74, 0.00),  0.05),
+            ("sphere", (-0.15, 0.74, 0.00), 0.05),
+            ("sphere", (0.00, 0.74, 0.15),  0.05),
+            ("sphere", (0.00, 0.74, -0.15), 0.05),
+        ]
+    if kind == "K":
+        return [
+            base, plinth,
+            ("cone", (0.0, 0.0), 0.14, 0.66, 0.28, 0.16),   # body (tallest)
+            ("cyl", (0.0, 0.0), 0.22, 0.66, 0.72),           # crown base
+            ("sphere", (0.0, 0.78, 0.0), 0.08),              # crown ball
+            # Cross on top: two thin cylinders
+            ("cyl", (0.0, 0.0), 0.03, 0.82, 1.02),           # vertical
+            ("cyl", (0.0, 0.0), 0.03, 0.92, 0.96),           # horizontal (approx w/ short thick cyl centered — visually reads as cross)
+        ]
+    return []
+
+# --- Scene assembly + trace -------------------------------------------------
+def _build_scene(board: chess.Board):
+    """Flatten every piece into a list of world-space primitives with material
+    tags ('W' white marble, 'B' black marble, 'J_R' ruby jewel, 'J_S' sapphire).
+    Also record (file, rank) per primitive so marble sampling stays consistent
+    per piece."""
+    prims = []
+    for rank in range(8):
+        for file in range(8):
+            sq = chess.square(file, rank)
+            piece = board.piece_at(sq)
+            if not piece:
+                continue
+            kind = piece.symbol().upper()
+            fx = file + 0.5
+            # White (rank 0/1) should be NEAR the camera (small z).
+            fz = rank + 0.5
+            mat = "W" if piece.color == chess.WHITE else "B"
+            jewel_mat = "J_R" if piece.color == chess.WHITE else "J_S"
+            local = _piece_primitives(kind)
+            # For queen and king, the jewel spheres on the crown get J_*
+            for i, p in enumerate(local):
+                is_jewel = (p[0] == "sphere" and
+                            ((kind == "Q" and i >= 4) or
+                             (kind == "K" and i in (5, 6)) or
+                             (kind == "B" and i == len(local) - 1)))
+                m = jewel_mat if is_jewel else mat
+                if p[0] == "sphere":
+                    _, (dx, dy, dz), r = p
+                    prims.append(("sphere", fx + dx, dy, fz + dz, r, m, file, rank))
+                elif p[0] == "cyl":
+                    _, (dx, dz), r, ymin, ymax = p
+                    prims.append(("cyl", fx + dx, fz + dz, r, ymin, ymax, m, file, rank))
+                elif p[0] == "cone":
+                    _, (dx, dz), yb, yt, rb, rt = p
+                    prims.append(("cone", fx + dx, fz + dz, yb, yt, rb, rt, m, file, rank))
+    return prims
+
+
+def _intersect_scene(ro, rd, prims):
+    """Return (t, prim_idx) per ray. prim_idx = -2 for board, -1 for miss."""
+    t_best = _isect_plane_y(ro, rd, 0.0)
+    idx_best = np.where(t_best < np.inf, -2, -1).astype(np.int32)
+    for i, p in enumerate(prims):
+        if p[0] == "sphere":
+            _, cx, cy, cz, r, _mat, _f, _rk = p
+            t = _isect_sphere(ro, rd, np.array([cx, cy, cz], dtype=np.float32), r)
+        elif p[0] == "cyl":
+            _, cx, cz, r, ymin, ymax, _mat, _f, _rk = p
+            t, _side = _isect_cylinder_y(ro, rd, cx, cz, r, ymin, ymax)
+        else:  # cone
+            _, cx, cz, yb, yt, rb, rt, _mat, _f, _rk = p
+            t = _isect_cone_y(ro, rd, cx, cz, yb, yt, rb, rt)
+        closer = t < t_best
+        t_best = np.where(closer, t, t_best)
+        idx_best = np.where(closer, i, idx_best)
+    return t_best, idx_best
+
+
+def _shadow_ray(hit_pt, light_dir, prims):
+    """Returns True per pixel where the hit point is in shadow.
+    Cheap: only tests occlusion by pieces (board never shadows the board)."""
+    ro = hit_pt + light_dir * 0.01
+    n = ro.shape[0]
+    in_shadow = np.zeros(n, dtype=bool)
+    for p in prims:
+        if in_shadow.all():
+            break
+        if p[0] == "sphere":
+            _, cx, cy, cz, r, _m, _f, _rk = p
+            t = _isect_sphere(ro, light_dir, np.array([cx, cy, cz], dtype=np.float32), r)
+        elif p[0] == "cyl":
+            _, cx, cz, r, ymin, ymax, _m, _f, _rk = p
+            t, _ = _isect_cylinder_y(ro, light_dir, cx, cz, r, ymin, ymax)
+        else:
+            _, cx, cz, yb, yt, rb, rt, _m, _f, _rk = p
+            t = _isect_cone_y(ro, light_dir, cx, cz, yb, yt, rb, rt)
+        in_shadow |= (t < np.inf)
+    return in_shadow
+
+
+def _compute_normal(prim, hit_pt):
+    """World-space normal for a hit on `prim` at hit_pt (n,3)."""
+    kind = prim[0]
+    if kind == "sphere":
+        _, cx, cy, cz, r, _m, _f, _rk = prim
+        n = hit_pt - np.array([cx, cy, cz], dtype=np.float32)
+        return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-9)
+    if kind == "cyl":
+        _, cx, cz, r, ymin, ymax, _m, _f, _rk = prim
+        # If y very close to top cap, normal = +Y; else side normal.
+        top = np.abs(hit_pt[:, 1] - ymax) < 1e-3
+        n = np.zeros_like(hit_pt)
+        n[:, 0] = hit_pt[:, 0] - cx
+        n[:, 2] = hit_pt[:, 2] - cz
+        norm_side = np.linalg.norm(n[:, [0, 2]], axis=1, keepdims=True) + 1e-9
+        n[:, [0, 2]] /= norm_side
+        n[top] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        return n
+    # cone frustum: normal in the (x-cx, z-cz) plane tilted by the slope
+    _, cx, cz, yb, yt, rb, rt, _m, _f, _rk = prim
+    dx = hit_pt[:, 0] - cx
+    dz = hit_pt[:, 2] - cz
+    radial = np.sqrt(dx * dx + dz * dz) + 1e-9
+    slope = (rt - rb) / (yt - yb)      # dr/dy
+    # Surface tangent-in-radial-plane = (1, slope), so normal = (1, -slope)^perp
+    n = np.zeros_like(hit_pt)
+    n[:, 0] = dx / radial
+    n[:, 2] = dz / radial
+    n[:, 1] = -slope
+    return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-9)
+
+
+# --- Materials + shading ----------------------------------------------------
+JEWEL_RUBY     = np.array([185,  40,  50], dtype=np.float32)
+JEWEL_SAPPHIRE = np.array([ 60, 130, 200], dtype=np.float32)
+
+def _sample_piece_at(hit_pt, prim, is_light):
+    """Sample piece texture (wood or marble depending on _MATERIAL).
+
+    Cylindrical UV so grain/rings wrap naturally around each piece body.
+    """
+    _init_textures()
+    sheet = _PIECE_LIGHT if is_light else _PIECE_DARK
+    _f, _rk = prim[-2], prim[-1]
+    H, W = sheet.shape[:2]
+    off_y = (_rk * 17 + _f * 23 + 7) % max(H - 8, 1)
+    off_x = (_f  * 29 + _rk * 13 + 5) % max(W - 8, 1)
+    cx = _f + 0.5
+    cz = _rk + 0.5
+    ang = np.arctan2(hit_pt[:, 0] - cx, hit_pt[:, 2] - cz)
+    u = ((ang / (2 * np.pi) + 0.5) * (W // 2) +
+         hit_pt[:, 1] * 4.0).astype(np.int32) % max(W // 2, 1)
+    v = (hit_pt[:, 1] * 18.0 +
+         np.sqrt((hit_pt[:, 0] - cx) ** 2 + (hit_pt[:, 2] - cz) ** 2) * 9.0
+         ).astype(np.int32) % max(H // 2, 1)
+    ys = np.clip(off_y + v, 0, H - 1)
+    xs = np.clip(off_x + u, 0, W - 1)
+    return sheet[ys, xs].astype(np.float32)
+
+
+def _sample_board_at(hit_pt):
+    """Sample board texture (wood or marble) with checkerboard light/dark."""
+    _init_textures()
+    fx = np.clip(np.floor(hit_pt[:, 0]).astype(np.int32), 0, 7)
+    fz = np.clip(np.floor(hit_pt[:, 2]).astype(np.int32), 0, 7)
+    is_light = ((fz + fx) % 2) == 1
+    L = _BOARD_LIGHT; D = _BOARD_DARK
+    H, W = L.shape[:2]
+    u = (hit_pt[:, 0] * (W / 8.0)).astype(np.int32) % W
+    v = (hit_pt[:, 2] * (H / 8.0)).astype(np.int32) % H
+    out = np.empty((hit_pt.shape[0], 3), dtype=np.float32)
+    out[is_light]  = L[v[is_light],  u[is_light]].astype(np.float32)
+    out[~is_light] = D[v[~is_light], u[~is_light]].astype(np.float32)
+    return out
+
+
+def _shade(hit_pt, normal, view_dir, base_color, in_shadow,
+           light_dir, specular_pow=64.0, specular_strength=0.35,
+           ambient=0.30):
+    """Phong-ish shading. Everything is (n,3) except the scalars."""
+    ndotl = np.clip((normal * light_dir).sum(axis=1), 0.0, 1.0)
+    ndotl = np.where(in_shadow, 0.0, ndotl)
+    diffuse = ndotl[:, None] * base_color
+    # Specular via half-vector
+    half = light_dir + view_dir
+    half = half / (np.linalg.norm(half, axis=1, keepdims=True) + 1e-9)
+    ndoth = np.clip((normal * half).sum(axis=1), 0.0, 1.0)
+    spec = (ndoth ** specular_pow)[:, None] * 255.0 * specular_strength
+    spec = np.where(in_shadow[:, None], 0.0, spec)
+    ambient_col = ambient * base_color
+    out = ambient_col + diffuse + spec
+    return np.clip(out, 0, 255)
+
+
+# --- Camera + main render ---------------------------------------------------
+_RENDER_CACHE = {}   # fen -> rendered numpy array (H, W, 3)
+_RENDER_CACHE_MAX = 32
+
+def _render_board_pixels(board: chess.Board) -> np.ndarray:
+    """Render the current position as a 3D scene. Returns (H, W, 3) uint8.
+    Result is cached by FEN — a full-board raytrace costs ~2s so we don't
+    want to redo it if the same position gets re-drawn (e.g. from a repeat
+    header refresh)."""
+    key = board.board_fen() + (" w" if board.turn else " b")
+    cached = _RENDER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out = _render_board_pixels_impl(board)
+    if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
+        # drop oldest (arbitrary — dict is insertion-ordered)
+        _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))
+    _RENDER_CACHE[key] = out
+    return out
+
+
+def _render_board_pixels_impl(board: chess.Board) -> np.ndarray:
+    """Render the current position as a 3D scene. Returns (H, W, 3) uint8."""
+    _init_textures()
+    H = W = 8 * SQ            # terminal footprint scales with SQ
+
+    # Camera: elevated behind the near edge, looking at the board center.
+    cam = np.array([4.0, 6.8, -3.5], dtype=np.float32)
+    target = np.array([4.0, 0.0, 4.0], dtype=np.float32)
+    up_world = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    fwd = target - cam
+    fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, up_world); right /= np.linalg.norm(right)
+    up = np.cross(right, fwd)
+    fov = 0.55   # radians half-angle-ish
+
+    # Build ray directions in world space (H*W, 3)
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
+    ndc_x = (xs / (W - 1)) * 2 - 1
+    ndc_y = 1 - (ys / (H - 1)) * 2
+    aspect = W / H
+    dir_cam = (right[None, None, :] * (ndc_x * fov * aspect)[..., None] +
+               up[None, None, :]   * (ndc_y * fov)[..., None] +
+               fwd[None, None, :])
+    dir_cam /= np.linalg.norm(dir_cam, axis=2, keepdims=True)
+    rd = dir_cam.reshape(-1, 3)
+    ro = np.broadcast_to(cam, rd.shape).copy()
+
+    prims = _build_scene(board)
+
+    t, idx = _intersect_scene(ro, rd, prims)
+    hit_pt = ro + rd * t[:, None]
+
+    # Backdrop color for misses (dark room)
+    img = np.zeros_like(rd)
+    img[:] = np.array([15, 12, 12], dtype=np.float32)
+
+    # ---- Board hits (idx == -2) ----
+    mb = idx == -2
+    if mb.any():
+        base = _sample_board_at(hit_pt[mb])
+        normal = np.zeros((mb.sum(), 3), dtype=np.float32)
+        normal[:, 1] = 1.0
+        light_dir = np.array([-0.5, 0.85, -0.2], dtype=np.float32)
+        light_dir /= np.linalg.norm(light_dir)
+        light_dir_b = np.broadcast_to(light_dir, normal.shape)
+        in_sh = _shadow_ray(hit_pt[mb], light_dir_b, prims)
+        view_dir = -rd[mb]
+        if _MATERIAL == "wood":
+            img[mb] = _shade(hit_pt[mb], normal, view_dir, base, in_sh,
+                             light_dir_b, specular_pow=24.0,
+                             specular_strength=0.10, ambient=0.50)
+        else:
+            img[mb] = _shade(hit_pt[mb], normal, view_dir, base, in_sh,
+                             light_dir_b, specular_pow=48.0,
+                             specular_strength=0.15, ambient=0.55)
+
+    # ---- Piece hits (idx >= 0) ----
+    hit_piece = idx >= 0
+    if hit_piece.any():
+        light_dir = np.array([-0.5, 0.85, -0.2], dtype=np.float32)
+        light_dir /= np.linalg.norm(light_dir)
+        for i, p in enumerate(prims):
+            mask = idx == i
+            if not mask.any():
+                continue
+            hp = hit_pt[mask]
+            normal = _compute_normal(p, hp)
+            ld_b = np.broadcast_to(light_dir, normal.shape)
+            # Only shadow-ray the front-facing pixels — back-facing ones are
+            # already dark from Lambertian and shadow makes no visible change.
+            front = (normal * ld_b).sum(axis=1) > 0.02
+            in_sh = np.zeros(hp.shape[0], dtype=bool)
+            if front.any():
+                in_sh[front] = _shadow_ray(hp[front], ld_b[front], prims)
+            mat = p[-3]
+            if mat == "J_R":
+                base = np.broadcast_to(JEWEL_RUBY,     (hp.shape[0], 3)).astype(np.float32)
+                spec_pow, spec_str, amb = 128.0, 0.7, 0.25
+            elif mat == "J_S":
+                base = np.broadcast_to(JEWEL_SAPPHIRE, (hp.shape[0], 3)).astype(np.float32)
+                spec_pow, spec_str, amb = 128.0, 0.7, 0.25
+            elif mat == "W":
+                base = _sample_piece_at(hp, p, is_light=True)
+                if _MATERIAL == "wood":
+                    spec_pow, spec_str, amb = 32.0, 0.22, 0.38   # satin oak
+                else:
+                    spec_pow, spec_str, amb = 64.0, 0.35, 0.35   # polished marble
+            else:
+                base = _sample_piece_at(hp, p, is_light=False)
+                if _MATERIAL == "wood":
+                    spec_pow, spec_str, amb = 28.0, 0.18, 0.28   # satin walnut
+                else:
+                    spec_pow, spec_str, amb = 64.0, 0.30, 0.20
+            view_dir = -rd[mask]
+            img[mask] = _shade(hp, normal, view_dir, base, in_sh, ld_b,
+                               specular_pow=spec_pow,
+                               specular_strength=spec_str, ambient=amb)
+
+    img = img.reshape(H, W, 3).clip(0, 255).astype(np.uint8)
+    # Frame around it
+    frame = 2
+    out = np.full((H + 2 * frame, W + 2 * frame, 3), BORDER, dtype=np.uint8)
+    out[frame:frame + H, frame:frame + W] = img
+    return out
+
+def _pixels_to_terminal(img: np.ndarray) -> str:
+    """Convert an (H, W, 3) image into terminal text using '▀' half-blocks.
+
+    Terminal cells are ~2:1 tall vs wide, so with plain half-blocks a square
+    image renders as a stretched-wide rectangle. We downsample X by 2 (average
+    each pair of pixel columns) so on-screen aspect ratio ends up ~correct,
+    and the board fits in ~130 columns instead of 260.
+
+    Half-block: fg = top pixel, bg = bottom pixel → 2 pixel rows per cell."""
+    H, W, _ = img.shape
+    if W % 2 == 1:  # pad to even width
+        img = np.hstack([img, np.full((H, 1, 3), BORDER, dtype=np.uint8)])
+        W += 1
+    # Horizontal downsample: average column pairs
+    img = ((img[:, 0::2].astype(np.uint16) +
+            img[:, 1::2].astype(np.uint16)) // 2).astype(np.uint8)
+    W = img.shape[1]
+    if H % 2 == 1:  # pad odd height
+        img = np.vstack([img, np.full((1, W, 3), BORDER, dtype=np.uint8)])
+        H += 1
+    out = []
+    for y in range(0, H, 2):
+        top = img[y]
+        bot = img[y + 1]
+        last_top = last_bot = None
+        line = []
+        for x in range(W):
+            t = tuple(int(v) for v in top[x])
+            b = tuple(int(v) for v in bot[x])
+            if t != last_top:
+                line.append(f"\033[38;2;{t[0]};{t[1]};{t[2]}m")
+                last_top = t
+            if b != last_bot:
+                line.append(f"\033[48;2;{b[0]};{b[1]};{b[2]}m")
+                last_bot = b
+            line.append("▀")
+        line.append(RESET)
+        out.append("".join(line))
+    return "\n".join(out)
+
+
+def _render_board_pixelart(board: chess.Board, header: str = "") -> str:
+    """Full pixel-art renderer with file/rank labels."""
+    img = _render_board_pixels(board)
+
+    label_fg = _fg(LABEL_FG); label_bg = _bg(LABEL_BG)
+    # File labels: one letter per 16-px square = ~8 chars, centered under board.
+    # Each square renders as (SQ // 2) terminal columns wide (we downsample
+    # X by 2) and (SQ // 2) terminal rows tall (half-block halves rows).
+    cell_cols = SQ // 2
+    cell_rows = SQ // 2
+
+    def build_file_row():
+        pad = " " * 3  # room for rank label prefix
+        cells = "".join(chr(ord("a") + f).center(cell_cols) for f in range(8))
+        return pad + cells
+
+    def build_rank_prefix(rank):
+        return f" {rank+1} "
+
+    # Compose lines: rank label + one board line
+    board_lines = _pixels_to_terminal(img).split("\n")
+    lines = []
+    if header:
+        lines.append(BOLD + header + RESET)
+    lines.append(build_file_row())
+    frame_rows = 1  # 2 px frame / 2 = 1 terminal row
+    idx = 0
+    while idx < frame_rows:
+        lines.append("   " + board_lines[idx])
+        idx += 1
+    for rank in range(7, -1, -1):
+        rank_lbl = build_rank_prefix(rank)
+        mid = cell_rows // 2
+        for r in range(cell_rows):
+            prefix = rank_lbl if r == mid else "   "
+            lines.append(prefix + board_lines[idx])
+            idx += 1
+    while idx < len(board_lines):
+        lines.append("   " + board_lines[idx])
+        idx += 1
+    lines.append(build_file_row())
+    return "\n".join(lines)
+
+
+# --- Plain ASCII fallback --------------------------------------------------
 UNICODE = {
     "P": "♙", "N": "♘", "B": "♗", "R": "♖", "Q": "♕", "K": "♔",
     "p": "♟", "n": "♞", "b": "♝", "r": "♜", "q": "♛", "k": "♚",
 }
-RESET = "\033[0m"
-LIGHT_BG = "\033[47m"
-DARK_BG  = "\033[100m"
-FG_BLACK = "\033[30m"
-FG_WHITE = "\033[97m"
-BOLD = "\033[1m"
+LIGHT_BG = "\033[47m"; DARK_BG = "\033[100m"
+FG_BLACK = "\033[30m"; FG_WHITE = "\033[97m"
 
-def render_board(board: chess.Board, header: str = ""):
+def _render_board_ascii(board: chess.Board, header: str = "") -> str:
     lines = []
     if header:
         lines.append(BOLD + header + RESET)
@@ -346,7 +1331,14 @@ def render_board(board: chess.Board, header: str = ""):
         row.append(f" {rank+1}")
         lines.append("".join(row))
     lines.append("   a  b  c  d  e  f  g  h ")
-    print("\n".join(lines))
+    return "\n".join(lines)
+
+
+def render_board(board: chess.Board, header: str = ""):
+    if os.environ.get("CHESS_ASCII"):
+        print(_render_board_ascii(board, header=header))
+    else:
+        print(_render_board_pixelart(board, header=header))
 
 
 def clear_screen():
