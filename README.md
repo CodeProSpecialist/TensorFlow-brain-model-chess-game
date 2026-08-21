@@ -12,14 +12,6 @@ python3 pretrain_parallel.py --dataset-size 8000 --engine-depth 8 \
 python3 tf_chess_brain_vs_brain.py --load ./chess_models --games 10 --delay 0.15
 ```
 
-# Wood pieces + wood board (default), sized for ~800×800 terminal
-python tf_chess_brain_vs_brain.py
-
-# Marble pieces + marble board
-CHESS_MATERIAL=marble python tf_chess_brain_vs_brain.py
-
-# Optional size tweak (default SQ=16)
-CHESS_SQ=18 python tf_chess_brain_vs_brain.py
 
 **Notes on the parallelism.** Two brains sharing one frozen foundation graph is subtle — Keras `train_on_batch` on each brain runs forward through the shared frozen ops and backward only into that brain's own head weights, so there's no gradient collision between threads. Each thread has its own optimizer state. The tiny per-brain target noise (`0.05` std) ensures P1 and P2 heads don't converge to identical predictors despite training on the same data.
 
