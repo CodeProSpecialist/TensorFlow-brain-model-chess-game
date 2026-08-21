@@ -364,7 +364,7 @@ if _MATERIAL not in ("wood", "marble"):
     _MATERIAL = "wood"
 # SQ = pixels per square edge in the rendered image.
 # Terminal footprint ≈ (8*SQ+frame)/2 columns and rows (X½ + ▀).
-# Default SQ=10 → ~44×44 cells (about 1/3 smaller than the old SQ=16 default).
+# Default SQ=10 → ~44 terminal cells wide.
 SQ = int(os.environ.get("CHESS_SQ", "10"))
 SQ = max(6, min(SQ, 48))
 
@@ -759,101 +759,80 @@ def _sprite(kind: str):
 # raytracing — pure pixel art that fits an ~800x800 terminal at SQ=16.
 # ---------------------------------------------------------------------------
 
-# 16-bit style fixed palettes (piece body layers)
+# Classic black & white 16-bit piece palettes (high contrast, clear icons).
+# Layers: 1=outline  2=shadow  3=mid  4=body  5=highlight  6=jewel accent
 _PAL_WHITE = {
-    1: (40,  35,  30),     # outline
-    2: (150, 140, 125),    # shadow
-    3: (200, 190, 175),    # midtone
-    4: (235, 228, 215),    # base
-    5: (255, 250, 240),    # highlight
-    6: (200,  45,  55),    # jewel ruby
+    1: (20,  20,  20),      # hard black outline
+    2: (160, 160, 160),     # soft gray shadow
+    3: (210, 210, 210),     # mid gray
+    4: (240, 240, 240),     # near-white body
+    5: (255, 255, 255),     # pure highlight
+    6: (90,  90,  90),      # dark jewel (B&W)
 }
 _PAL_BLACK = {
-    1: (0,    0,   0),
-    2: (18,  15,  14),
-    3: (48,  42,  40),
-    4: (78,  70,  68),
-    5: (120, 110, 105),
-    6: (55, 120, 190),     # jewel sapphire
+    1: (0,    0,   0),      # pure black outline
+    2: (25,  25,  25),      # deep shadow
+    3: (55,  55,  55),      # dark mid
+    4: (85,  85,  85),      # body
+    5: (140, 140, 140),     # highlight so form reads on dark squares
+    6: (200, 200, 200),     # light jewel accent
 }
-# When material is wood, shift white/black piece palettes toward oak/walnut
-_PAL_OAK = {
-    1: (55,  35,  15),
-    2: (130,  95,  50),
-    3: (175, 135,  80),
-    4: (210, 170, 110),
-    5: (240, 210, 155),
-    6: (185,  40,  50),
-}
-_PAL_WALNUT = {
-    1: (8,    4,   2),
-    2: (28,  16,   8),
-    3: (48,  28,  16),
-    4: (70,  42,  24),
-    5: (100,  65,  40),
-    6: (60, 130, 200),
-}
+
+# Board square colours — pure B&W checkerboard
+_SQ_LIGHT = np.array([232, 232, 232], dtype=np.uint8)   # off-white
+_SQ_DARK  = np.array([ 48,  48,  48], dtype=np.uint8)   # charcoal
+_SQ_LIGHT_BEVEL_HI = (255, 255, 255)
+_SQ_LIGHT_BEVEL_LO = (180, 180, 180)
+_SQ_DARK_BEVEL_HI  = ( 80,  80,  80)
+_SQ_DARK_BEVEL_LO  = ( 15,  15,  15)
 
 
 def _piece_palette(color_white: bool):
-    if _MATERIAL == "wood":
-        return _PAL_OAK if color_white else _PAL_WALNUT
     return _PAL_WHITE if color_white else _PAL_BLACK
 
 
 def _square_pixels(is_light: bool, file: int, rank: int):
-    """2D square fill with texture + 16-bit bevel (top/left hi, bottom/right lo)."""
-    _init_textures()
-    sheet = _BOARD_LIGHT if is_light else _BOARD_DARK
-    max_off = max(sheet.shape[0] - SQ, 0)
-    y0 = (rank * 7 + file * 13) % (max_off + 1)
-    x0 = (rank * 11 + file * 5 + 3) % (max_off + 1)
-    px = sheet[y0:y0 + SQ, x0:x0 + SQ].copy()
-    # Classic 16-bit bevel (1px)
-    px[0, :]  = BEVEL_HI
-    px[:, 0]  = BEVEL_HI
-    px[SQ - 1, :] = BEVEL_LO
-    px[:, SQ - 1] = BEVEL_LO
-    # Optional corner soften so bevel meets cleanly
-    px[0, SQ - 1] = tuple((a + b) // 2 for a, b in zip(BEVEL_HI, BEVEL_LO))
-    px[SQ - 1, 0] = tuple((a + b) // 2 for a, b in zip(BEVEL_HI, BEVEL_LO))
+    """Flat B&W square with 16-bit bevel + subtle dither for TG-16 texture."""
+    base = _SQ_LIGHT if is_light else _SQ_DARK
+    px = np.empty((SQ, SQ, 3), dtype=np.uint8)
+    px[:, :] = base
+    # Fine checker dither (classic 16-bit texture, ± 1)
+    for r in range(SQ):
+        for c in range(SQ):
+            if (r + c) & 1:
+                if is_light:
+                    px[r, c] = (224, 224, 224)
+                else:
+                    px[r, c] = (56, 56, 56)
+    # 1px bevel
+    hi = _SQ_LIGHT_BEVEL_HI if is_light else _SQ_DARK_BEVEL_HI
+    lo = _SQ_LIGHT_BEVEL_LO if is_light else _SQ_DARK_BEVEL_LO
+    px[0, :]  = hi
+    px[:, 0]  = hi
+    px[SQ - 1, :] = lo
+    px[:, SQ - 1] = lo
+    px[0, SQ - 1] = tuple((a + b) // 2 for a, b in zip(hi, lo))
+    px[SQ - 1, 0] = tuple((a + b) // 2 for a, b in zip(hi, lo))
     return px
 
 
 def _paint_piece(sq_px, kind, color_white, file, rank):
-    """Composite sprite onto square pixels (in-place). Transparent '.' skipped."""
+    """Composite detailed sprite onto square (in-place). Outline drawn first
+    for a clean 16-bit icon silhouette, then body layers."""
     mask = _sprite(kind)
     pal = _piece_palette(color_white)
-    # Wood mode: tint sprite body slightly with procedural grain from piece sheet
-    if _MATERIAL == "wood":
-        _init_textures()
-        sheet = _PIECE_LIGHT if color_white else _PIECE_DARK
-        H, W = sheet.shape[:2]
-        off_y = (rank * 17 + file * 23 + 7) % max(H - SQ, 1)
-        off_x = (file * 29 + rank * 13 + 5) % max(W - SQ, 1)
-        grain = sheet[off_y:off_y + SQ, off_x:off_x + SQ]
-        if grain.shape[0] != SQ or grain.shape[1] != SQ:
-            grain = None
-    else:
-        grain = None
-
-    for r in range(SQ):
-        for c in range(SQ):
-            layer = int(mask[r, c])
-            if layer == 0:
-                continue
-            col = pal[layer]
-            if grain is not None and layer in (2, 3, 4, 5):
-                # Blend 25% grain into body layers for carved-wood feel
-                g = grain[r, c].astype(np.float32)
-                col = tuple(int(0.75 * col[i] + 0.25 * g[i]) for i in range(3))
-            sq_px[r, c] = col
+    # Two-pass: outline first (so it never gets covered), then body
+    for layer in (1, 2, 3, 4, 5, 6):
+        col = pal[layer]
+        for r in range(SQ):
+            for c in range(SQ):
+                if int(mask[r, c]) == layer:
+                    sq_px[r, c] = col
     return sq_px
 
 
 def _render_board_2d(board: chess.Board) -> np.ndarray:
-    """Build a flat 2D 16-bit style board image (H, W, 3) uint8."""
-    _init_textures()
+    """Flat 2D black-and-white board with detailed 16-bit piece icons."""
     H = W = 8 * SQ
     img = np.zeros((H, W, 3), dtype=np.uint8)
     for rank in range(8):
@@ -864,13 +843,11 @@ def _render_board_2d(board: chess.Board) -> np.ndarray:
             if piece:
                 kind = piece.symbol().upper()
                 _paint_piece(sq, kind, piece.color == chess.WHITE, file, rank)
-            # rank 0 is near bottom of image (white's side) → row 7 in image coords
             y0 = (7 - rank) * SQ
             x0 = file * SQ
             img[y0:y0 + SQ, x0:x0 + SQ] = sq
-    # Thin outer frame
     frame = 2
-    out = np.full((H + 2 * frame, W + 2 * frame, 3), BORDER, dtype=np.uint8)
+    out = np.full((H + 2 * frame, W + 2 * frame, 3), (20, 20, 20), dtype=np.uint8)
     out[frame:frame + H, frame:frame + W] = img
     return out
 
