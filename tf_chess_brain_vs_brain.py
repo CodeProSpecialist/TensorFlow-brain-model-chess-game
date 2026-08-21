@@ -717,20 +717,30 @@ SPRITES = {
 }
 
 # Build integer sprite masks once
+_NATIVE_SPRITE = 32   # SPRITES atlas is authored at 32x32
+
 def _compile_sprites():
+    """Parse 32x32 atlas, then nearest-neighbor scale to SQ for TG-16 look."""
     out = {}
     for k, rows in SPRITES.items():
-        # 0=trans, 1=outline O, 2=shadow S, 3=midtone M, 4=base B, 5=highlight H, 6=jewel J
-        m = np.zeros((SQ, SQ), dtype=np.int8)
+        m32 = np.zeros((_NATIVE_SPRITE, _NATIVE_SPRITE), dtype=np.int8)
         for r, row in enumerate(rows):
-            for c, ch in enumerate(row.ljust(SQ)[:SQ]):
-                if   ch == "O": m[r, c] = 1
-                elif ch == "S": m[r, c] = 2
-                elif ch == "M": m[r, c] = 3
-                elif ch == "B": m[r, c] = 4
-                elif ch == "H": m[r, c] = 5
-                elif ch == "J": m[r, c] = 6
-        out[k] = m
+            if r >= _NATIVE_SPRITE:
+                break
+            for c, ch in enumerate(row.ljust(_NATIVE_SPRITE)[:_NATIVE_SPRITE]):
+                if   ch == "O": m32[r, c] = 1
+                elif ch == "S": m32[r, c] = 2
+                elif ch == "M": m32[r, c] = 3
+                elif ch == "B": m32[r, c] = 4
+                elif ch == "H": m32[r, c] = 5
+                elif ch == "J": m32[r, c] = 6
+        if SQ == _NATIVE_SPRITE:
+            out[k] = m32
+        else:
+            # Nearest-neighbor scale → crisp 16-bit pixels, no blur
+            ys = (np.arange(SQ) * _NATIVE_SPRITE // SQ)
+            xs = (np.arange(SQ) * _NATIVE_SPRITE // SQ)
+            out[k] = m32[ys][:, xs]
     return out
 
 _SPRITE_MASKS = None
@@ -740,20 +750,129 @@ def _sprite(kind: str):
         _SPRITE_MASKS = _compile_sprites()
     return _SPRITE_MASKS[kind]
 
+
+# ---------------------------------------------------------------------------
+# 2D 16-bit (TurboGrafx-16 / SNES) board renderer
+#
+# Flat top-down view, crisp nearest-neighbor sprites, bevelled squares,
+# limited-palette feel with dither on dark squares. No perspective, no
+# raytracing — pure pixel art that fits an ~800x800 terminal at SQ=16.
+# ---------------------------------------------------------------------------
+
+# 16-bit style fixed palettes (piece body layers)
+_PAL_WHITE = {
+    1: (40,  35,  30),     # outline
+    2: (150, 140, 125),    # shadow
+    3: (200, 190, 175),    # midtone
+    4: (235, 228, 215),    # base
+    5: (255, 250, 240),    # highlight
+    6: (200,  45,  55),    # jewel ruby
+}
+_PAL_BLACK = {
+    1: (0,    0,   0),
+    2: (18,  15,  14),
+    3: (48,  42,  40),
+    4: (78,  70,  68),
+    5: (120, 110, 105),
+    6: (55, 120, 190),     # jewel sapphire
+}
+# When material is wood, shift white/black piece palettes toward oak/walnut
+_PAL_OAK = {
+    1: (55,  35,  15),
+    2: (130,  95,  50),
+    3: (175, 135,  80),
+    4: (210, 170, 110),
+    5: (240, 210, 155),
+    6: (185,  40,  50),
+}
+_PAL_WALNUT = {
+    1: (8,    4,   2),
+    2: (28,  16,   8),
+    3: (48,  28,  16),
+    4: (70,  42,  24),
+    5: (100,  65,  40),
+    6: (60, 130, 200),
+}
+
+
+def _piece_palette(color_white: bool):
+    if _MATERIAL == "wood":
+        return _PAL_OAK if color_white else _PAL_WALNUT
+    return _PAL_WHITE if color_white else _PAL_BLACK
+
+
 def _square_pixels(is_light: bool, file: int, rank: int):
-    """Kept for backward-compat — the 3D renderer builds its own board plane."""
+    """2D square fill with texture + 16-bit bevel (top/left hi, bottom/right lo)."""
     _init_textures()
     sheet = _BOARD_LIGHT if is_light else _BOARD_DARK
     max_off = max(sheet.shape[0] - SQ, 0)
     y0 = (rank * 7 + file * 13) % (max_off + 1)
     x0 = (rank * 11 + file * 5 + 3) % (max_off + 1)
     px = sheet[y0:y0 + SQ, x0:x0 + SQ].copy()
-    px[0, :] = BEVEL_HI;   px[:, 0] = BEVEL_HI
-    px[SQ - 1, :] = BEVEL_LO; px[:, SQ - 1] = BEVEL_LO
+    # Classic 16-bit bevel (1px)
+    px[0, :]  = BEVEL_HI
+    px[:, 0]  = BEVEL_HI
+    px[SQ - 1, :] = BEVEL_LO
+    px[:, SQ - 1] = BEVEL_LO
+    # Optional corner soften so bevel meets cleanly
+    px[0, SQ - 1] = tuple((a + b) // 2 for a, b in zip(BEVEL_HI, BEVEL_LO))
+    px[SQ - 1, 0] = tuple((a + b) // 2 for a, b in zip(BEVEL_HI, BEVEL_LO))
     return px
 
+
 def _paint_piece(sq_px, kind, color_white, file, rank):
-    pass  # unused by 3D renderer; kept as a no-op for API compatibility
+    """Composite sprite onto square pixels (in-place). Transparent '.' skipped."""
+    mask = _sprite(kind)
+    pal = _piece_palette(color_white)
+    # Wood mode: tint sprite body slightly with procedural grain from piece sheet
+    if _MATERIAL == "wood":
+        _init_textures()
+        sheet = _PIECE_LIGHT if color_white else _PIECE_DARK
+        H, W = sheet.shape[:2]
+        off_y = (rank * 17 + file * 23 + 7) % max(H - SQ, 1)
+        off_x = (file * 29 + rank * 13 + 5) % max(W - SQ, 1)
+        grain = sheet[off_y:off_y + SQ, off_x:off_x + SQ]
+        if grain.shape[0] != SQ or grain.shape[1] != SQ:
+            grain = None
+    else:
+        grain = None
+
+    for r in range(SQ):
+        for c in range(SQ):
+            layer = int(mask[r, c])
+            if layer == 0:
+                continue
+            col = pal[layer]
+            if grain is not None and layer in (2, 3, 4, 5):
+                # Blend 25% grain into body layers for carved-wood feel
+                g = grain[r, c].astype(np.float32)
+                col = tuple(int(0.75 * col[i] + 0.25 * g[i]) for i in range(3))
+            sq_px[r, c] = col
+    return sq_px
+
+
+def _render_board_2d(board: chess.Board) -> np.ndarray:
+    """Build a flat 2D 16-bit style board image (H, W, 3) uint8."""
+    _init_textures()
+    H = W = 8 * SQ
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    for rank in range(8):
+        for file in range(8):
+            is_light = ((rank + file) % 2) == 1
+            sq = _square_pixels(is_light, file, rank)
+            piece = board.piece_at(chess.square(file, rank))
+            if piece:
+                kind = piece.symbol().upper()
+                _paint_piece(sq, kind, piece.color == chess.WHITE, file, rank)
+            # rank 0 is near bottom of image (white's side) → row 7 in image coords
+            y0 = (7 - rank) * SQ
+            x0 = file * SQ
+            img[y0:y0 + SQ, x0:x0 + SQ] = sq
+    # Thin outer frame
+    frame = 2
+    out = np.full((H + 2 * frame, W + 2 * frame, 3), BORDER, dtype=np.uint8)
+    out[frame:frame + H, frame:frame + W] = img
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1092,22 +1211,25 @@ def _shade(hit_pt, normal, view_dir, base_color, in_shadow,
     return np.clip(out, 0, 255)
 
 
-# --- Camera + main render ---------------------------------------------------
+# --- Main board render (2D 16-bit by default; 3D still available via CHESS_3D=1)
 _RENDER_CACHE = {}   # fen -> rendered numpy array (H, W, 3)
 _RENDER_CACHE_MAX = 32
 
 def _render_board_pixels(board: chess.Board) -> np.ndarray:
-    """Render the current position as a 3D scene. Returns (H, W, 3) uint8.
-    Result is cached by FEN — a full-board raytrace costs ~2s so we don't
-    want to redo it if the same position gets re-drawn (e.g. from a repeat
-    header refresh)."""
-    key = board.board_fen() + (" w" if board.turn else " b")
+    """Render the current position. Default is flat 2D TurboGrafx-16 style.
+    Set CHESS_3D=1 to use the slow ray-marched 3D path instead.
+    Results are cached by FEN so redraws of the same position are free."""
+    key = (board.board_fen() + (" w" if board.turn else " b")
+           + "|" + _MATERIAL + "|" + ("3d" if os.environ.get("CHESS_3D") else "2d")
+           + f"|sq{SQ}")
     cached = _RENDER_CACHE.get(key)
     if cached is not None:
         return cached
-    out = _render_board_pixels_impl(board)
+    if os.environ.get("CHESS_3D"):
+        out = _render_board_pixels_impl(board)
+    else:
+        out = _render_board_2d(board)
     if len(_RENDER_CACHE) >= _RENDER_CACHE_MAX:
-        # drop oldest (arbitrary — dict is insertion-ordered)
         _RENDER_CACHE.pop(next(iter(_RENDER_CACHE)))
     _RENDER_CACHE[key] = out
     return out
